@@ -56,6 +56,7 @@ Toby looks for its components next to itself (folders `lc0/`, `nets/`, `maia/`),
 | `TOBY_MAIA_WEIGHTS` | Full path of the Maia-3 weights (`maia3-79m.pt`) |
 | `TOBY_MAIA_REPO` | A clone of the [Maia-3 repository](https://github.com/CSSLab/maia3), if you run Toby from the Python source |
 | `TOBY_DEVICE` | `cpu` (default) or `cuda`, for Maia |
+| `TOBY_BACKEND` | Backend of `lc0` (default `cuda`; with your own `lc0` build, for example `blas` or `onnx-dml`). Other backends are untested and might be much slower |
 
 </details>
 
