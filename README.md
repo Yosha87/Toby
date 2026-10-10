@@ -2,9 +2,9 @@
 
 # Toby - The Oracle By Yosha
 
-**A free, open-source chess engine that predicts what a human will actually play, and how good each move really is for that player.**
+**The best chess predictor of human moves, free and open-source, based on Maia and Leela.**
 
-Give Toby the ratings of the two players and the time control: for every move, he returns the probability that it is played and its win / draw / loss. It works in ChessBase, Nibbler, and any UCI interface that shows MultiPV lines.
+Toby predicts what a human will actually play, and how good each move really is for that player. Give him the ratings of the two players and the time control: for every move, he returns the probability that it is played and its win / draw / loss. It works in ChessBase, Nibbler, and any UCI interface that shows MultiPV lines.
 
 > **Method page (tests, results, failures):** [docs/METHOD.md](docs/METHOD.md)
 
