@@ -83,6 +83,8 @@ More on the [method page](docs/METHOD.md).
 
 Unzip a package, then add `toby.exe` (in the `Toby` folder) as a UCI engine in your interface.
 
+![How to read Toby in ChessBase and in Nibbler](docs/gui_chessbase_nibbler.png)
+
 **ChessBase:** Engines > Create UCI engine > choose Toby; open its options and set White Rating, Black Rating, Rating Source, Time Control and Display = ChessBase. Start an analysis and wait a few seconds.
 In the lines, the score column is the percentage of players of that rating who play the move, and the bar / numbers are its win, draw and loss. When it is Black's turn ChessBase shows the numbers with a minus sign: read the absolute value.
 
