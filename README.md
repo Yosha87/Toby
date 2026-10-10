@@ -106,3 +106,5 @@ While it thinks: Maia's prediction appears at once, a first correction after abo
 Toby can be used for broadcasts, training, opening preparation, anti-cheating, bot creation, etc. Contributions are welcome: code, games, and tests in other chess interfaces.
 
 I have dedicated hundreds of hours to Oracle and Toby. If you value my work, please consider [making a donation](https://www.paypal.com/donate/?hosted_button_id=6WTAEDBXAPTLC).
+
+<p align="center"><a href="https://www.paypal.com/donate/?hosted_button_id=6WTAEDBXAPTLC"><img src="https://yoshachess.com/wp-content/uploads/2024/07/Paypal.png" width="246" alt="Donate with PayPal"></a><br><em>I would be very thankful. &#128591;</em></p>
