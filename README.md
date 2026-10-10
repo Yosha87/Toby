@@ -35,14 +35,14 @@ The gain is large in classical, smaller in rapid, small in blitz. Full results, 
 
 | Package | Size | Contains | Take it if |
 |---|---|---|---|
-| **Toby-full** (default) | 1.4 GB | Toby, Maia-3, Leela (`lc0`, CUDA 12) and the BT3 network | You want it to work right away. |
+| **Toby-full** (default) | 1.4 GB | Toby, Maia-3, Leela (`lc0`, CUDA 12) and the BT3 network | You have an NVIDIA graphics card and want it to work right away. |
 | **Toby-Maia** | 0.63 GB | Toby and the Maia-3 weights | You already have Leela (`lc0`) and a network. |
 | **Toby-Leela** | 1.09 GB | Toby, `lc0` and the BT3 network | You already have the Maia-3 weights. |
 | **Toby-core** | 0.33 GB | Toby only | You have both Leela and Maia. |
 
 **Download:** [Toby-full.zip](https://github.com/Yosha87/Toby/releases/latest/download/Toby-full.zip) - [Toby-Maia.zip](https://github.com/Yosha87/Toby/releases/latest/download/Toby-Maia.zip) - [Toby-Leela.zip](https://github.com/Yosha87/Toby/releases/latest/download/Toby-Leela.zip) - [Toby-core.zip](https://github.com/Yosha87/Toby/releases/latest/download/Toby-core.zip)
 
-Unzip anywhere (Windows 64-bit): everything is in the `Toby` folder, then add `toby.exe` as a UCI engine. Leela runs best on an NVIDIA graphics card. Maia's prediction appears immediately, then Toby's numbers are corrected as Leela's search progresses and stop changing after about 2 to 3 seconds (on a laptop GPU), when Leela reaches 1,024 nodes. Tested on one Windows 11 computer with an NVIDIA laptop GPU, in ChessBase and in Nibbler.
+Unzip anywhere (Windows 64-bit): everything is in the `Toby` folder, then add `toby.exe` as a UCI engine. The Leela in the packages is the CUDA build: it needs an NVIDIA graphics card (without one, use Toby-Maia or Toby-core with your own `lc0` build, see below; not tested). Maia's prediction appears immediately, then Toby's numbers are corrected as Leela's search progresses and stop changing after about 2 to 3 seconds (on a laptop GPU), when Leela reaches 1,024 nodes. Tested on one Windows 11 computer with an NVIDIA laptop GPU, in ChessBase and in Nibbler.
 
 <details>
 <summary>Using your own Maia or Leela</summary>
