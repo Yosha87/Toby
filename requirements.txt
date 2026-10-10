@@ -1,0 +1,5 @@
+python-chess
+numpy
+torch
+huggingface-hub>=0.23
+# Maia-3: clone https://github.com/CSSLab/maia3 next to toby_uci.py (or set TOBY_MAIA_REPO)

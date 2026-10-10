@@ -1,0 +1,1 @@
+setoption name White Rating value 1600

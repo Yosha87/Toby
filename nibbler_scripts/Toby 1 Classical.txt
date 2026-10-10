@@ -1,0 +1,2 @@
+setoption name Rating Source value FIDE
+setoption name Time Control value Classical
