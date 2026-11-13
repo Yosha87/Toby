@@ -140,6 +140,6 @@ While it thinks: Maia's prediction appears at once, then Toby's final result.
 
 ## Support
 
-Contributions are welcome: code, games, tests in other interfaces. I have spent hundreds of hours on Oracle and Toby; if you value this work, please consider [a donation](https://www.paypal.com/donate/?hosted_button_id=6WTAEDBXAPTLC).
+Contributions are welcome: code, games, tests in other interfaces. I have spent hundreds of hours on Oracle and Toby; if you value this work, please consider [a donation](https://tribychess.org/support).
 
-<p align="center"><a href="https://www.paypal.com/donate/?hosted_button_id=6WTAEDBXAPTLC"><img src="docs/paypal_donate.png" width="246" alt="Donate with PayPal"></a></p>
+<p align="center"><a href="https://tribychess.org/support"><strong>Support Triby</strong></a></p>
