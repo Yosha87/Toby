@@ -1,151 +1,154 @@
-# Toby: method page
+# Toby - Method, tests, and results
 
+*Last updated 2026-11-12 (Toby 1.0, sealed test v6).*
 
----
+Toby applies my formula **Human Thinking = Intuition + Analysis = System 1 + System 2** (Daniel Kahneman's two systems) to human chess moves: intuition (Maia) corrected by calculation (Leela and Stockfish). It is the full version of Oracle, my proof of concept of this approach in 2024 ([GitHub](https://github.com/Yosha87/Oracle), [article](https://yoshachess.com/article/oracle-best-human-like-chess-engine/)).
 
-## 1. What "test games" means
+This page describes how Toby works and how it was tested. Every number here was measured on the networks and settings released in Toby 1.0, against Maia-3.
 
-* **Test games** are games that were never used to choose the rule, the constants, or any other setting of Toby.
-* Before opening a set of test games, the protocol (what is computed, which comparison, which success criteria) was written down, committed to the repository, and tagged. Only then were the games analysed, once.
-* Every result is computed game by game: confidence intervals (95%) come from a bootstrap that resamples whole games, not positions.
-* Failures are published, with their causes (section 5).
+## 1. How Toby is tested
 
-| Test | Tag (protocol / results) | Games | What it tested |
-|---|---|---|---|
-| Final test | `protocole-final-v1*` / `resultats-final-v1` | 1,500 classical (TWIC); about 430 rapid and 407 blitz Lichess games, plus 300 TWIC games for each of rapid and blitz | Moves and evaluation, three time controls |
-| OTB / online validation test | `protocole-lieu-v1` / `resultats-lieu-v1` | 300 TWIC games and 435 / 405 Lichess games (rapid / blitz) | Evaluation only, after separating OTB and online constants |
+* **Sealed tests.** The test games were never used for anything before the test: not for training, not for choosing settings. The protocol (which games, which measures, the success criteria and the decisions that follow) was written, dated and committed to the development repository, with the hashes of every input, before the games were downloaded (10 November 2026), and the analysis was run once. That repository is private.
+* **Uncertainty.** Every difference comes with a 95% confidence interval from a bootstrap that resamples whole games (1,000 draws).
+* **Positions.** Up to 10 positions per game, drawn at random between half-moves 20 and 99 (the main sample), with the game's previous moves; the opening (half-moves 1-19) and long endgames (100+) are separate samples with their own criteria. Levels are the FIDE-equivalent rating of the player to move.
 
-The games of the final test were used afterwards to fit the OTB / online constants; they are no longer a test set. The validation test used other games.
+| Time control | Test games | Positions (half-moves 20-99) |
+|---|---|---|
+| Classical (over the board) | 1,268 games of 26 October - 9 November 2026, FIDE standard time control **measured from the players' clocks**: 1,053 from the Lichess broadcasts of 1-9 November, 44 from The Week in Chess (events checked against those broadcasts) and 171 over-the-board games of 26-31 October from another collection; up to 250 games per rating band (400 at 2250-2500, all 118 available at 2500+) | 12,580 |
+| Rapid and blitz (over the board) | 349 games of the same broadcasts, rapid or blitz by their clocks | 3,490 |
+| Rapid and blitz (online) | 1,984 rated Lichess games of 1-9 November 2026 (989 rapid, 995 blitz), about 100 per band of the players' Lichess rating from 600 to 2600+ | 19,840 |
 
-## 2. The move rule
+## 2. How Toby predicts the move
 
-For every legal move of the position:
+1. **Maia-3** (79 M parameters) gives, for every legal move, the probability that a human plays it. It is given the previous positions of the game and an input rating.
+   * In classical: a **Maia-3 fine-tuned on 1,299,033 over-the-board classical games** (105 million positions, from the released weights), at an input rating mapped from Toby's strength estimate E (fitted on training games so that each level's moves are best predicted). The games: over-the-board broadcasts on Lichess (2020 to June 2026) whose time control was measured from the clocks and is FIDE standard; games of The Week in Chess (TWIC) from events whose games were checked against those broadcasts; and TWIC games before 2020, minus the event families found to include rapid or online games. None of the test games.
+   * In rapid and blitz: the released Maia-3 at the player's Lichess rating (a Chess.com rating through its Lichess equivalent, a FIDE rating through the tables; at most 2800).
+2. **The calculators** give the value of every move:
+   * `Precision = Fast` in classical: **Stockfish 19** (150,000 nodes for every move, then 250,000 on the candidates: Maia's three first choices and Stockfish's two best moves) plus **one evaluation of the position by Leela** (lc0 0.32, BT3 network, raw policy, no search). Leela runs on the NVIDIA graphics card, or on the processor if there is none.
+   * `Precision = Accurate` in classical with an NVIDIA graphics card: **Leela's search** (1,024 nodes), with the moves Leela barely explored valued by Stockfish 19 (converted to Leela's scale by a table fitted on the training data), and the same Stockfish values given to the network too. Without an NVIDIA card, Accurate is Fast.
+   * Rapid and blitz (both settings): **Stockfish 19 alone** (300,000 nodes, every legal move in one search).
+3. **The correction**: score = ln p_Maia + f(context, move), then a softmax over the legal moves. f is a small neural network; one per setting: **H6b** (Fast, classical), **AA** (Accurate, classical), **R10** (rapid and blitz). Its inputs: Maia's probability of the move (at the input rating and at the player's own rating), the move's value and its loss against the best move in expected score (never raw centipawns), Leela's policy where Leela is used, the value of the position, the ratings of both players, the time control, over the board or online, and a few features of the position. Untrained, the network is Maia. The networks are trained by maximum likelihood of the move played on real games (over the board and online), with separate development games for early stopping and for choosing between candidates; no test game.
 
-1. **Maia-3** (79 M parameters) gives its probability `p` for a player of the given rating. The rating given to Maia is raised in classical games (strength + 700, capped at 2900), and set to the Lichess-equivalent rating (capped at 2800) in rapid and blitz.
-2. **Leela** (BT3 network, 1024 nodes) gives the value of each move. The loss of a move is its expected-score difference with Leela's best (most-visited) move, in points. Moves that received fewer than 8 visits get a short extra search (64 nodes). A move that still has no value keeps exactly its Maia probability.
-3. Toby computes `score(move) = ln p - lambda x loss/100 + gamma x [best move]`, then normalises with a softmax.
-4. For strong players, a "ramp" raises the weight of Leela's best move when Maia gives it very little: below `p1 = 0.08 x (E - 2200) / 500` (capped at 20%) its prior is replaced by `0.8 p1 + 0.2 p`.
+E is the strength as a FIDE-equivalent rating: Lichess and Chess.com ratings are converted with the tables of [ChessGoals](https://chessgoals.com/rating-comparison/), a public page that compiles Chess.com and Lichess data (margin of +/- 70 to 115 points). The tables have no data below a FIDE equivalent of about 1660: below, one FIDE point is counted as one Lichess point (Chess.com through its Lichess equivalent), so that the conversion and its inverse agree exactly and Maia always receives the player's own Lichess rating. Such a strength is a convention, not a measure: Toby shows it as "E <= 1400" (below FIDE's lowest rating) or "by convention".
 
-| Mode | Rating given to Maia | Severity lambda | Bonus gamma |
-|---|---|---|---|
-| Classical | E + 700, capped at 2900 | max(0; 3.44 + 5.25 x (E - 2000)/1000) | 0.43 |
-| Rapid | Lichess-rapid equivalent of E, capped at 2800 | max(0; (E - 2100) / 72.5) | 0.43 x min(1; lambda) |
-| Blitz | Lichess-blitz equivalent of E, capped at 2800 | max(0; (E - 2200) / 98) | 0.26 x min(1; lambda) |
-
-`E` is the strength as a FIDE-equivalent rating (Lichess and Chess.com ratings are converted with the tables of [ChessGoals](https://chessgoals.com/rating-comparison/), a public page that compiles Chess.com and Lichess data; margin of +/- 70 to 115 points). The loss is measured in expected score, never in raw centipawns. Below its threshold each mode plays exactly like Maia.
+**Why the time control was measured.** Classifying games as classical by the name of the event is not enough. Among TWIC games labelled classical by their event name and also found in the Lichess broadcasts, the clocks show a starting time under 30 minutes for 31% of them in 2020, 16% in 2021, and still 3 to 6% each year since 2022 (World Cup tie-breaks, Champions Chess Tour, rapid Grand Prix events...). Toby's classical training games were therefore checked against the clocks.
 
 ## 3. The evaluation (win / draw / loss)
 
-* For each move, Toby estimates the win, draw, and loss of **a player of that level** against a player of that level, not of a perfect engine.
-* It combines Leela's expected score and Maia's value head (read at a rating of at most 2700) in a Davidson-type three-outcome model: the difference between the two sides sets the win / loss balance and a draw term depends on the strength of the players, on how unbalanced the position is, and on Maia's draw estimate. Equal inputs give 50%.
-* Constants are fitted per time control. For rapid and blitz there are separate OTB and online constants (OTB when the rating source is FIDE, online for Lichess and Chess.com; classical is always OTB). When the opponent's rating is given, a second set of constants uses it.
-* A move that gives mate is 100% win; a mate forced further away is not (a player can miss it).
-* Fit: five-fold cross-validation by game on open data, constants then frozen.
+* For each move, Toby estimates the win, draw and loss of **a player of that level** against a player of that level, not of a perfect engine. With Stockfish it is computed for the 12 most probable moves.
+* It combines the engine's expected score and Maia's value head in a Davidson-type three-outcome model: the difference between the two sides sets the win / loss balance; a draw term depends on the strength of the players, on how unbalanced the position is, and on Maia's draw estimate. Constants are fitted on real game results, per time control, with separate over-the-board and online constants, and a set that uses the opponent's rating when it is given. An endgame term corrects the evaluation where a human of a given level does not always convert or hold what the engine sees.
+* **Endgame Evaluation = M** (default): the evaluation of the position is the expectation of its moves' evaluations under Toby's probabilities, so it includes the chance that this player plays each move of this position.
+* **Deepening** (default, in infinite analysis): after the first answer, Toby evaluates the position after the three most probable moves and after the move with the best evaluation, and blends that next position's own evaluation into those moves' evaluations (one updated block).
 
-## 4. Data
+## 4. Results (sealed test v6)
 
-* **Games:** TWIC (OTB games: classical, rapid, blitz) and Lichess (monthly dumps, non-bot games, CC0). Test games are absent from the tuning data.
-* **Positions:** 10 random positions per game, plies 20-99 for the final test. Positions where Leela returned nothing (forced moves) were left out (83 / 32 / 30 in classical / rapid / blitz).
-* **Tuning:** open data, about 15,000 classical, 7,100 rapid and 9,500 blitz positions at the first fit of the evaluation, plus the earlier benchmark games.
-* **Hardware:** test runs used a rented GPU (RTX 4090 or equivalent) for Leela and an ordinary PC for Maia. In the engine itself, a position takes about 2 to 3 seconds on a laptop with a small GPU; Maia's prediction appears immediately.
+### 4.1 Move prediction, classical
 
-## 5. Results
+Log-likelihood of the move actually played (higher is better) / share of positions where it is the first choice, 12,580 positions:
 
-### 5.1 Moves (final test)
-
-| | Top-1: move actually played = most likely move |
-|---|---|
-| Classical, 1,500 games, 14,917 positions | Maia at real rating 52.4 [51.5; 53.2]; Leela 53.9; Maia with the boosted rating 55.3; **Toby 58.7 [57.9; 59.6]** |
-| Rapid, 14,311 positions (E >= 2100) | Maia (boosted) 58.0; **Toby 60.4**; Leela 52.2 |
-| Blitz, 12,926 positions (E >= 2200) | Maia (boosted) 60.4; **Toby 61.1**; Leela 49.4 |
-
-* Toby's correction alone (against Maia given the same boosted rating): classical **+3.45 points [+2.92; +3.99]**, rapid **+2.40 [+1.87; +2.96]**, blitz **+0.74 [+0.35; +1.14]**.
-* All eight pre-registered classical criteria passed.
-* In rapid the pre-registered comparison (Lichess games only) passed: +1.76 [+0.94; +2.60].
-* **Failure, blitz:** on the pre-registered Lichess games the gain was +0.05 [-0.64; +0.67] and the criterion "non-inferior to Maia within 0.5 point" failed by 0.14 point. The pooled blitz figure above (all fresh games, OTB and online) is an after-the-fact analysis, not part of the protocol.
-* At 2600 and above in classical games, Leela alone does as well as Toby (61.1% against 61.3%); Toby's edge there is over Maia (54.7%).
-
-### 5.2 Move quality
-
-Classes by expected-score loss measured by Leela: good <= 5 points, inaccuracy 5-10, mistake 10-20, blunder > 20. Random samples of the fresh games (500 classical, 300 rapid, 300 blitz games), current engine.
-
-| Blunders (share of moves) | Real players | Maia (boosted rating) | Toby |
+| | Maia-3 | **Toby Fast (H6b)** | **Toby Accurate (AA)** (default) |
 |---|---|---|---|
-| Classical | 3.5% | 8.9% | 3.5% |
-| Rapid | 3.6% | 8.6% | 4.1% |
-| Blitz | 5.2% | 8.6% | 5.8% |
+| All levels | -1.168 / 59.8% | **-1.079 / 62.8%** | **-1.065 / 63.5%** |
+| below 1700 | -1.177 / 59.7% | -1.168 / 60.3% | -1.165 / 60.4% |
+| 1700-2000 | -1.171 / 60.3% | -1.134 / 61.5% | -1.132 / 61.5% |
+| 2000-2250 | -1.170 / 60.2% | -1.099 / 62.6% | -1.087 / 63.5% |
+| 2250-2500 | -1.176 / 59.2% | -1.032 / 64.0% | -1.010 / 64.9% |
+| 2500+ | -1.118 / 60.3% | -0.894 / 67.0% | -0.857 / 69.0% |
 
-| AESL (points per move; measured with Leela's values, so partly circular for Toby) | Real players | Maia | Toby |
+Maia-3 here is given the previous moves and the rating Toby gives it.
+
+* Gain over Maia-3 in log-likelihood: +0.089 (Fast) and +0.103 (Accurate). Against the networks of the 4 November development version (Fast T5, Accurate T10): Fast +0.016 [+0.011; +0.020] and +0.5 point of first choices; Accurate +0.006 [+0.004; +0.008] and +0.25 point.
+* The gain over Maia grows with the level: below 1700 Toby is close to Maia; from 2250 its first choice is right 5 to 9 points more often.
+
+### 4.2 Move prediction, rapid and blitz
+
+Same measures, 23,330 positions of 2,333 games (Toby = R10, the same in both settings):
+
+| | Positions | Maia-3 | **Toby** | Toby - Maia-3, log-likelihood [95%] |
+|---|---|---|---|---|
+| All | 23,330 | -1.247 / 58.1% | **-1.234 / 58.5%** | +0.014 [+0.011; +0.016] |
+| Rapid, online | 9,890 | -1.279 / 57.8% | -1.265 / 58.3% | +0.013 [+0.010; +0.017] |
+| Blitz, online | 9,950 | -1.241 / 58.1% | -1.237 / 58.2% | +0.004 [+0.001; +0.006] |
+| Rapid, over the board | 1,290 | -1.205 / 58.1% | -1.143 / 59.2% | +0.062 [+0.041; +0.082] |
+| Blitz, over the board | 2,200 | -1.161 / 60.0% | -1.130 / 60.9% | +0.032 [+0.022; +0.042] |
+
+**Online, Toby is barely better than Maia-3** (about +1% of probability on the move played in rapid, +0.5% in blitz); over the board the gain is larger but rests on fewer games. (Maia-3's column was computed after the test from the same sealed data; it is reported, not a criterion.)
+
+### 4.3 Mistakes (one move drawn at random from the probabilities; judge: Stockfish 19, 2 million nodes per move)
+
+Losses are measured in expected score at the level of the player to move (blunder: more than 20 points; mistake: 10 to 20).
+
+| | Real players | Maia-3 | Toby Fast | Toby Accurate |
+|---|---|---|---|---|
+| Classical, blunders | 2.9% | 7.1% | 3.2% | **3.0%** |
+| Classical, mistakes | 5.2% | 7.3% | 5.2% | **5.0%** |
+| Classical 2500+, blunders | 1.1% | 8.4% | 2.0% | 1.7% |
+| Rapid and blitz, blunders | 6.7% | - | 6.9% | 6.9% |
+
+In classical, Maia, which does not calculate, gives far too much probability to blunders; Toby's mistakes are close to the real ones, except at 2500+, where it still blunders too often (section 6).
+
+**Playing level** (reported, not a criterion): mean loss in expected score of a move drawn from the network minus that of the move actually played, in points per move. Classical: Fast +0.19 [+0.08; +0.28], Accurate +0.02 [-0.08; +0.12], Maia-3 +2.12; at 2500+: Fast +0.60, Accurate +0.39, Maia-3 +3.74. Rapid and blitz: Toby +0.13 [+0.03; +0.24] (4.7 points per move against the players' 4.6), Maia-3 +0.90. No network plays clearly too strong; all play a little too weak at 2500+, mostly through blunders.
+
+### 4.4 Evaluation (win / draw / loss of the position, against the game result)
+
+Both options were checked on the sealed games, each against the evaluation without it, with the log-likelihood of the game result (both ratings given; positions of every half-move):
+
+* **Endgame Evaluation M** against Off: +0.0047 [+0.0013; +0.0081] (3,601 games), no significant loss in any time control or level: on by default everywhere.
+* **Deepening** against M: +0.0047 [+0.0040; +0.0057], positive in every time control and level band: on by default in analysis.
+
+Calibration of the released evaluation (Fast, both ratings, M + Deepening; computed after the test from the same data, reported only). Log-loss of the result (lower is better; a constant forecast with the group's own proportions in brackets) and mean gap between the announced expected score and the actual score (10 groups of positions):
+
+| | Positions | Log-loss | Gap |
 |---|---|---|---|
-| Classical | 3.04 | 5.84 | 3.11 |
-| Rapid | 3.30 | 5.78 | 3.46 |
-| Blitz | 3.65 | 5.31 | 3.90 |
+| Classical, over the board | 17,188 | 0.715 (1.095) | **0.9 point** |
+| Rapid, over the board | 1,763 | 0.704 (1.032) | 2.4 points |
+| Blitz, over the board | 3,025 | 0.720 (1.049) | 2.1 points |
+| Rapid, online | 13,338 | 0.713 (0.896) | 3.0 points |
+| Blitz, online | 13,379 | 0.775 (0.909) | 1.3 points |
 
-Blunders account for 75 / 80 / 86% of the AESL gap between Maia and real players (classical / rapid / blitz).
+In classical the announced expected score is within about one point of the actual score on average; in rapid and blitz the gap is larger.
 
-### 5.3 Evaluation, final test
+### 4.5 Matches (Toby against Toby, and against Maia-3)
 
-| Classical, three-outcome log-loss (lower is better) | |
-|---|---|
-| **Toby** (rating only) | **0.7884** |
-| **Toby with the opponent's rating** | **0.7157** |
-| Leela alone (raw WDL) | 0.8647 |
-| Maia alone (value head) | 1.1210 |
-| Constant frequencies | 1.0986 |
+Engine as shipped, moves drawn from the probabilities, classical, clocks 90 min + 30 s, both sides at the same rating; 30 openings (after half-move 16) each played with both colours: 60 games per cell. Judge: Stockfish 19, 1 million nodes. 95% intervals by bootstrap over the openings.
 
-* Calibration (mean gap between predicted and actual expected score, in points): Toby 7.4, Leela 27.1, Maia 48.6.
-* **Failure, rapid and blitz (Lichess games):** criteria E1, E3, and E5 failed. Rapid log-loss 0.8055 for Toby against 0.8074 for Maia alone; calibration 13.8 points.
-* **Cause:** the constants had been fitted on a mix of OTB (TWIC) and online (Lichess) games, but the same strength draws far more often OTB: in balanced positions 38-50% against 17-24% online in rapid, and 24% against 15% in blitz. The model predicted about 33% in rapid, right for neither.
+**Toby 1.0 against the 4 November development version** (the networks published as a working step on 4 November: T5 for Fast, T10 for Accurate), score of Toby 1.0:
 
-### 5.4 Evaluation, OTB / online validation test (after the fix)
+| Rating | Fast: H6b vs T5 | Accurate: AA vs T10 |
+|---|---|---|
+| 1600 | 47.5% [35.0; 60.0] | **33.3% [22.5; 45.0]** |
+| 2000 | 50.0% [40.0; 59.2] | 54.2% [42.5; 66.7] |
+| 2400 | 56.7% [45.8; 67.5] | 50.8% [40.8; 61.7] |
+| 2600 | **63.3% [54.2; 72.5]** | 52.5% [45.0; 60.0] |
 
-19 of 24 pre-registered criteria passed.
+![Toby 1.0 against the 4 November development version](match_4_november.png)
 
-| Log-loss | New constants | Previous constants | Maia alone |
-|---|---|---|---|
-| Rapid, OTB (300 games) | **0.7832** | 0.7913 | 0.9400 |
-| Rapid, online (435 games) | **0.8388** | 0.8693 | 0.8506 |
-| Blitz, OTB (300 games) | **0.8141** | 0.8295 | 0.8428 |
-| Blitz, online (405 games) | **0.8177** | 0.8227 | 0.8361 |
+Fast is stronger at 2600 (about +95 Elo), as expected: the 4 November Fast network blundered too much above 2250. Accurate is the same at 2000-2600 but **weaker at 1600** (about -120 Elo; it blundered more in these games, 4.5 against 4.0 per 100 moves), although on the human positions of the sealed test its blunders below 1700 match the real players' (3.9% against 4.0%). A head-to-head measures relative strength, not faithfulness to human play; the sealed test measures the latter.
 
-* **Criteria that failed:** rapid OTB, gain over the previous constants not significant (-0.0080 [-0.0199; +0.0039]); rapid online, not demonstrably better than Maia alone (-0.0118 [-0.0282; +0.0051]); giving the opponent's rating gains little online; blitz online calibration 8.3 points against a bar of 8.
-* OTB, the opponent's rating helps a lot: rapid 0.7832 -> 0.7005, blitz 0.8141 -> 0.7535, classical 0.7884 -> 0.7157.
+**Toby (Fast) against Maia-3 alone** (Maia's input rating: min(R + 700, 2900)): Toby scores 75.8% at 1600, 91.7% at 2000, 99.2% at 2400 and 95.8% at 2600 (114 wins, 6 draws, 0 losses in the 120 games at 2400 and 2600). Maia-3 blunders 5 to 6.6 times per 100 moves at every rating; Toby goes from 5.0 at 1600 to 1.1 at 2600.
 
-## 6. What was tried and not kept
+## 5. How the 1.0 networks were chosen, and what was not kept
 
-All on tuning data unless stated; none of these changed the rule.
+* The sealed test compared candidates with the networks of the 4 November version, with criteria fixed in advance (prediction overall and per level, mistakes, the opening and long-endgame samples). **Fast, classical:** H6b was the only candidate to pass every criterion (the five other candidates failed the long-endgame sample, one of them also a level band). **Rapid and blitz:** no candidate passed (two hybrid networks with Leela's policy failed the long-endgame sample and the blunder criterion at 2250+): R10, the Stockfish-only network, stays.
+* **Accurate, classical: AA was adopted after the results, outside the protocol's rule.** The rule kept T10: AA failed only the long-endgame sample (half-moves 100+, 805 positions), for lack of evidence rather than because it is worse there (log-likelihood -0.0007 [-0.011; +0.011]). It passed every other criterion, is better overall (+0.006 log-likelihood) and above 2000, and blunders as T10 does. This decision was taken by Yosha Iglesias and recorded openly in the protocol; the next sealed test re-tests AA with enough late positions.
+* More Stockfish nodes: no gain beyond about 250,000 nodes (100,000 are enough in blitz).
 
-| Idea | Result |
-|---|---|
-| Reuse Leela's search tree from one position to the next (faster analysis) | Same top move in 97% of positions, no loss in predicting the real move (log-likelihood -0.0076 [-0.019; +0.003]), but end-to-end time unchanged (a second Leela process slows the first by ~25%). Not adopted. |
-| Oracle's mate-in-1 factor, or a flat penalty for moves allowing mate | No gain. Toby already gives such moves 3.3% of the probability, like real players (3.3%). |
-| Fading the correction in the opening | Helps classical only after move 30, hurts rapid and blitz. Not adopted. |
-| A "puzzle gap" term for positions right after a blunder | No gain on ordinary games. Dropped. |
-| Sharing the best-move ramp between moves with almost the same value (weight exp(-loss/tau), tau = 1 to 12 points) | Worse: classical -0.0046 [-0.0071; -0.0023] at tau = 1, worse still at larger tau; rapid -0.0040; blitz neutral. |
-| Sharing only the constant bonus gamma between near-equivalent moves | Classical +0.0022 [+0.0006; +0.0039] at tau = 1; nothing in rapid and blitz. Too small and not confirmed on fresh games: not adopted. |
-| Sharing both bonuses only between moves tied for Leela's value (<= 1 point) AND Maia's probability (within a factor 1.25-2) | Worse in classical (-0.0011 to -0.0043) and rapid (-0.0007 to -0.0052); neutral in blitz. |
-| A Leela search of 4096 nodes instead of 1024 (everything else unchanged; protocol written before the results) | **Moves, 2,937 tuning positions (paired):** log-likelihood +0.004 [-0.004; +0.013], top-1 -0.34 point [-0.87; +0.14]; the pre-registered non-inferiority margin on top-1 (-0.5 point) was not met, so 1024 was kept. The best move changes in 12% of the positions (3% between two 1024-node searches), in both directions. **Final-test positions (paired, same positions at both budgets):** classical (6,000) top-1 57.85% at 1024 against 57.72% at 4096 (-0.13 [-0.53; +0.25]), evaluation log-loss 0.7743 against 0.7757; rapid (3,000) 59.67% against 59.43% (-0.23 [-0.72; +0.26]), 0.8394 against 0.8401; blitz (3,000) 60.90% against 60.90%, 0.8186 against 0.8184. Calibration unchanged. Only Leela's raw win / draw / loss improves (log-loss 0.849 -> 0.844 classical, 1.095 -> 1.071 rapid, 1.263 -> 1.218 blitz): the model's constants were fitted with 1024-node values. No measurable gain on moves or on evaluation: 1024 is kept. |
+## 6. Limits
 
-**What the last tests show:** when two moves have the same value for Leela and the same probability for Maia, players still choose Leela's most-visited move more often than the other: 56% in classical, 65% in rapid, 56% in blitz (clean tied pairs where one of the two was played, n = 559 / 244 / 421; Maia alone would say 50.5%). The move that Leela's search favours carries information that neither the value nor Maia's probability contain, so the bonus is kept on that single move.
+* Online, Toby is barely better than Maia-3 used at the player's own rating. The clear gain is in classical, above 2000.
+* At 2500+ in classical, Toby still blunders too often: about 1.7% of its moves with Accurate and 2.0% with Fast, real players 1.1%. This is the main target of the next version.
+* Accurate needs an NVIDIA graphics card; without one, Toby uses Fast. Accurate at 1600 lost its match against the 4 November version (section 4.5).
+* Ratings are converted between FIDE, Lichess and Chess.com with public tables (margin of about 70 to 115 points). Below a FIDE equivalent of about 1660 they have no data: the strength shown there is a convention.
+* The tests use recent games (2026). Other periods or contexts were not tested.
+* Toby is validated with Stockfish 19, lc0 v0.32 and the BT3-768x15x24h-swa-2790000 network. Newer versions run (their version is shown in Toby's summary line), but without guarantee: they have to be tested before they are validated.
+* The win / draw / loss evaluation is very reliable in classical; in rapid and blitz it is less well calibrated (section 4.4).
 
-**Run-to-run stability.** Because Leela's search is not deterministic, which of two near-tied moves is the most visited can change from one run to the next. We searched 470 classical positions (mover rating 2200+) containing such a near-tie twice, each time from a fresh tree at 1024 nodes. The most-visited move was the same in 82% of the positions (the highest-Q move: 67%). Toby's two distributions differ by 0.028 on average (total variation), by more than 0.2 in 8 positions (1.7%), never by more than 0.4; the probability of the move actually played moves by 1.7 points on average. A 4096-node search did not predict the played move better than 1024 nodes (51% against 48% on 65 positions, within noise), so Toby does not search longer on near-ties. The point of the previous paragraph holds on these new searches too: the move played is the most-visited one more often than the other tied moves (43-46% against 25% if all tied moves were equivalent; 54-59% in the clean pairs, n about 60).
+## 7. Data
 
-## 7. Limits
-
-* The gains are measured **against Maia**; Toby is not claimed to be the best possible predictor.
-* Blitz: +0.7 point on average over the fresh games, not demonstrated on the pre-registered Lichess test.
-* Online rapid and blitz evaluation: Maia alone is nearly as well calibrated as Toby.
-* Puzzle-like positions (one move much better than the second best, typically right after an opponent's blunder): the evaluation gives the player to move 6 to 8 points less than he really scores (selection effect, no correction).
-* Classical online (Lichess classical) is calibrated with the OTB constants; Chess.com has no test games.
-* Rating conversion: the source tables have no data below about FIDE 1660. Below that, Toby takes one FIDE point to be one platform point (only used in rapid and blitz with a FIDE rating); nothing was tested there, and in these modes below 2100 / 2200 Toby plays like Maia.
-* Opening: no test before move 10; in classical games Toby is slightly below Maia before move 20 (-0.021 and -0.016 in log-likelihood at plies 0-9 and 10-19; not significant).
-* 10 random positions per game, not whole games.
-* Toby predicts an "average" player of a rating, not a specific person.
-* Not fully deterministic, because Leela's search is not: two analyses of the same position differ by 3 points on average in Toby's probabilities (more than 10 points in about 10% of positions), and the win / draw / loss of a move changes by a point or two.
-* Near-ties: when two moves are equivalent for Leela, which one receives the bonus can change from one run to the next (it is the more visited one). See section 6.
+* **Games:** The Week in Chess (over the board), Lichess (rated games, no bots; CC0) and the Lichess broadcast database (over-the-board events). Test games are absent from all training and tuning data. None of these game collections is redistributed with Toby.
+* **Hardware:** rented GPUs (RTX 3090 / 4090, A40, L40S) for Leela, Maia and the fine-tuning, CPU servers for Stockfish.
 
 ## 8. Checking
 
-The protocols (written and tagged before the test games were opened), the full result reports including the failed criteria, the scripts and the list of test games are kept in the development repository.
-It is not public: it is opened to anyone who wants to check the figures, on request: contact@yoshachess.com.
+The protocols (written and tagged before the test games were opened), the full result reports including the failed criteria, the scripts and the list of test games are kept in a private development repository.
 

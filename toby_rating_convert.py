@@ -5,12 +5,13 @@ toby_rating_convert.py - converts a rating (FIDE, Chess.com, Lichess) into a FID
 DATA SOURCE: ChessGoals, "Rating Comparison" - https://chessgoals.com/rating-comparison/ (public page).
 ChessGoals built these tables from about 20,000 active players who have a rating on several platforms (Chess.com blitz as the common base; 1,923 active FIDE players),
 themselves taken from the public Chess.com and Lichess data. Margins given by the source: +/- 75 (FIDE), +/- 70 (Lichess blitz), +/- 90 (Lichess rapid and classical),
-+/- 115 (Chess.com rapid). There is no FIDE data below about 1550-1660 FIDE.
++/- 115 (Chess.com rapid). There is no FIDE data below about 1660 FIDE: below, see to_fide (a convention, not data).
 The values below are copied from the tables of that public page; the source is credited here and in NOTICE.md.
 
 Usage: to_fide(2610, "lichess", "blitz") -> ~2400
 """
 import bisect
+import os
 
 # Table 1: Chess.com blitz (column 0) -> bullet, rapid, USCF, FIDE (None = no data)
 _CC = [
@@ -61,40 +62,103 @@ def _interp(x, xs, ys):
     return ys[k - 1] + s * (x - xs[k - 1])
 
 
-def to_fide(rating, platform, cadence="blitz"):
-    """FIDE equivalent of a rating. platform: 'fide', 'chesscom', 'lichess'; cadence: 'blitz', 'rapid', 'bullet', 'classical' (Lichess only)."""
+def _lin(x, xs, ys):
+    """Piecewise-linear interpolation through the table points; outside the table: slope of the last segment above, slope 1 below
+    (the source has no data below its lowest point: one point of one scale is taken to be one point of the other)."""
+    if x < xs[0]:
+        return ys[0] - (xs[0] - x)
+    return _interp(x, xs, ys)
+
+
+def _lin_inv(y, xs, ys):
+    """Exact inverse of _lin (xs and ys both strictly increasing)."""
+    if y < ys[0]:
+        return xs[0] - (ys[0] - y)
+    return _interp(y, ys, xs)
+
+
+def _platform(platform):
     platform = platform.lower().replace(".", "").replace("-", "")
+    if platform in ("chesscom", "chess"):
+        return "chesscom"
+    if platform in ("fide", "lichess"):
+        return platform
+    raise ValueError("unknown platform: fide, chesscom or lichess")
+
+
+def _cc_to_li(r, cadence):
+    """Chess.com rating -> Lichess rating of the same time control, through the USCF column shared by the two tables (no FIDE involved)."""
+    return _lin_inv(_lin(r, *_CC_US[cadence]), *_LI_US[cadence])
+
+
+def _li_to_cc(r, cadence):
+    return _lin_inv(_lin(r, *_LI_US[cadence]), *_CC_US[cadence])
+
+
+def to_fide(rating, platform, cadence="blitz"):
+    """FIDE equivalent of a rating. platform: 'fide', 'chesscom', 'lichess'; cadence: 'blitz', 'rapid', 'bullet', 'classical' (Lichess only).
+    Lichess: the table, and below its lowest FIDE point (about 1660) one FIDE point per Lichess point. Chess.com: the table down to its lowest
+    FIDE point; below, through the Lichess equivalent (Chess.com -> Lichess table, then the Lichess rule). from_fide is the exact inverse."""
+    platform = _platform(platform)
     if platform == "fide":
         return float(rating)
-    if platform in ("chesscom", "chess"):
+    if platform == "chesscom":
         if cadence not in _COLS_CC:
-            raise ValueError("chess.com : cadence blitz, rapid ou bullet")
+            raise ValueError("chess.com: time control blitz, rapid or bullet")
         xs, ys = _pairs(_CC, _COLS_CC[cadence])
-        return _interp(rating, xs, ys)
-    if platform == "lichess":
-        xs, ys = _pairs(_LI, _COLS_LI[cadence])
-        return _interp(rating, xs, ys)
-    raise ValueError("plateforme inconnue : fide, chesscom ou lichess")
+        if rating >= xs[0]:
+            return float(_interp(rating, xs, ys))
+        return to_fide(_cc_to_li(rating, cadence), "lichess", cadence)
+    return float(_lin(rating, *_pairs(_LI, _COLS_LI[cadence])))
 
 
 def from_fide(fide, platform, cadence="blitz"):
-    """Inverse function: rating (on the given platform and time control) of a player whose strength is the given FIDE equivalent."""
-    platform = platform.lower().replace(".", "").replace("-", "")
+    """Exact inverse of to_fide: rating (on the given platform and time control) of a player whose strength is the given FIDE equivalent."""
+    platform = _platform(platform)
     if platform == "fide":
         return float(fide)
-    if platform in ("chesscom", "chess"):
+    if platform == "chesscom":
         xs, ys = _pairs(_CC, _COLS_CC[cadence])
-    elif platform == "lichess":
-        xs, ys = _pairs(_LI, _COLS_LI[cadence])
-    else:
-        raise ValueError("plateforme inconnue : fide, chesscom ou lichess")
-    order = sorted(range(len(ys)), key=lambda k: ys[k])
-    xs, ys = [xs[k] for k in order], [ys[k] for k in order]
+        if fide >= ys[0]:
+            return float(_interp(fide, ys, xs))
+        return _li_to_cc(from_fide(fide, "lichess", cadence), cadence)
+    return float(_lin_inv(fide, *_pairs(_LI, _COLS_LI[cadence])))
+
+
+def _us_pairs(table, col, us):
+    p = sorted((r[col], r[us]) for r in table)
+    return [a for a, _ in p], [b for _, b in p]
+
+
+_CC_US = {c: _us_pairs(_CC, i, 3) for c, i in _COLS_CC.items()}   # Chess.com -> USCF
+_LI_US = {c: _us_pairs(_LI, i, 4) for c, i in _COLS_LI.items()}   # Lichess -> USCF
+
+
+# Conversion of Toby up to October 2026 (kept to rebuild and compare the earlier data): below the lowest FIDE point, platform -> FIDE extrapolated the
+# last, nearly flat segment of the table (Lichess rapid 800 -> 1513), while FIDE -> platform used one point per point: the two were not inverse.
+def to_fide_v1(rating, platform, cadence="blitz"):
+    platform = _platform(platform)
+    if platform == "fide":
+        return float(rating)
+    xs, ys = _pairs(_CC, _COLS_CC[cadence]) if platform == "chesscom" else _pairs(_LI, _COLS_LI[cadence])
+    return float(_interp(rating, xs, ys))
+
+
+def from_fide_v1(fide, platform, cadence="blitz"):
+    platform = _platform(platform)
+    if platform == "fide":
+        return float(fide)
+    xs, ys = _pairs(_CC, _COLS_CC[cadence]) if platform == "chesscom" else _pairs(_LI, _COLS_LI[cadence])
     if fide < ys[0]:
-        # Below the lowest FIDE value of the tables (about 1660) the source has no data: extrapolating its last, nearly flat segment gives absurd platform ratings
-        # (FIDE 1400 -> Lichess blitz -330). Below that point one FIDE point is taken to be one platform point.
         return xs[0] - (ys[0] - fide)
-    return _interp(fide, ys, xs)   # x = FIDE values, y = platform ratings
+    return _interp(fide, ys, xs)
+
+
+# Conversion used by the engine: v2 (adopted after the sealed test of the protocol of that test, 2026-10-28); TOBY_RATING_CONVERSION=v1 reproduces the earlier one.
+CONVERSION = os.environ.get("TOBY_RATING_CONVERSION", "v2")
+if CONVERSION == "v1":
+    to_fide_v2, from_fide_v2 = to_fide, from_fide
+    to_fide, from_fide = to_fide_v1, from_fide_v1
 
 
 if __name__ == "__main__":
