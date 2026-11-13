@@ -70,11 +70,11 @@ Speed on a test machine (4 processor cores, NVIDIA T4): about 0.5 s per position
 
 | Package | For |
 |---|---|
-| [Toby-full.zip](https://toby.tribychess.org/Toby-full.zip) (3.9 GB) | Windows with an NVIDIA graphics card |
-| [Toby-light.zip](https://toby.tribychess.org/Toby-light.zip) (0.9 GB) | Windows, any computer |
-| [Toby-core.zip](https://toby.tribychess.org/Toby-core.zip) (0.17 GB) | Toby only, if you have the components |
-| [Toby-linux-full.zip](https://toby.tribychess.org/Toby-linux-full.zip) (4.1 GB) | Linux (glibc 2.35+) with an NVIDIA graphics card |
-| [Toby-linux-light.zip](https://toby.tribychess.org/Toby-linux-light.zip) (1.0 GB) | Linux (glibc 2.35+), any computer |
+| [Toby-full.zip](https://toby.tribychess.org/Toby-full-2026-11-13.zip) (3.9 GB) | Windows with an NVIDIA graphics card |
+| [Toby-light.zip](https://toby.tribychess.org/Toby-light-2026-11-13.zip) (0.9 GB) | Windows, any computer |
+| [Toby-core.zip](https://toby.tribychess.org/Toby-core-2026-11-13.zip) (0.17 GB) | Toby only, if you have the components |
+| [Toby-linux-full.zip](https://toby.tribychess.org/Toby-linux-full-2026-11-13.zip) (4.1 GB) | Linux (glibc 2.35+) with an NVIDIA graphics card |
+| [Toby-linux-light.zip](https://toby.tribychess.org/Toby-linux-light-2026-11-13.zip) (1.0 GB) | Linux (glibc 2.35+), any computer |
 
 Checksums: [toby_manifest.json](https://toby.tribychess.org/toby_manifest.json). Unzip, then add `Toby/toby.exe` (Linux: `Toby/toby`) as a UCI engine. If Windows complains about `c10.dll`, install the [Visual C++ redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 
