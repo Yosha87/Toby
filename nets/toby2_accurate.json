@@ -1,0 +1,266 @@
+{
+ "format": "toby2-config/1",
+ "network": {
+  "file": "toby2_b.pt",
+  "sha256": "3219cfc6f01bcd218441f67466475f27b05174fd462c40c8a4053d9753a1b281",
+  "format": "toby2-b/1",
+  "source_model_sha256": "92babc35a289907bf1d228263fa1a03cd2867cea131b5409d7a83163bb322b83",
+  "source_model": "model_10M.pt",
+  "seed": 1,
+  "storage": "fp16 (exact: the training weights are fp16)",
+  "size_bytes": 371302841
+ },
+ "candidates": "Network",
+ "candidate_pass": "masked",
+ "candidate_procedure": [
+  "1. t = 0: B's body pass (ratings, cadence, venue; values never enter the body) in parallel with Stockfish pass 1 (MultiPV over every legal move, 150,000 nodes, 1 thread, Hash 64 MB cleared, FEN only)",
+  "2. as soon as the body is done: B's move head with EVERY value input masked (valued = 0 on all moves, as the masked-values training rows) -> B's top 3 (ties: the lower legal-move index first, numpy stable argsort)",
+  "3. candidates = that top 3 + Stockfish's top 2 at pass 1, legal, no duplicate, in this order (toby2.v2_candidates)",
+  "4. pass 2: MultiPV over the candidates (if >= 2), 250,000 nodes, Hash cleared; started on a second single-thread Stockfish as soon as the top 3 is known, kept only if the final candidate list equals the top 3, else recomputed (same values either way: each search starts from a cleared hash)",
+  "5. values = pass 1's, replaced by pass 2's on the candidates; B's heads on them -> distribution and W/D/L"
+ ],
+ "candidates_rule": "sealed protocol 11.2 gate 9 (report v7_toby2_final_ab.md section 8: Network). The sealed scoring must replicate candidate_procedure exactly (the engine's procedure, not the dev check's)",
+ "values": {
+  "rule": "Stockfish values given on every position (sealed protocol 1.4), classical below 2200 included",
+  "recipe": "toby_uci.sf_v2 = toby2.Toby2Search: Stockfish 19, MultiPV over every legal move at V2_BASE = 150,000 nodes, then MultiPV over the candidates (candidate source top 3 + Stockfish's top 2, toby_uci.v2_candidates order) at V2_EXT = 250,000 nodes; 1 thread, Hash 64 MB cleared before every search, FEN only, deepest completed iteration",
+  "stockfish": "Stockfish 19 (bench 2497913)",
+  "scored_path": "analysis (no time limit: values always computed)",
+  "short_time_masked_below_s": 0.6
+ },
+ "clock": {
+  "rule": "cadence only in analysis",
+  "inputs": "Time Control option = the game's cadence (Classical / Rapid / Blitz), venue OTB; base, increment and both clocks given as unknown (options Base Time 0, Increment -1)",
+  "full_clock_path": "go wtime btime (reported only)"
+ },
+ "position_evaluation": "Network (B's W/D/L head); Toby 1.0's line M only by rule 6.5",
+ "product": "Toby 2 Accurate",
+ "protocol_name": "Toby 2 Accurate (sealed protocol 1.1)",
+ "device": "cuda",
+ "gpu_only": "offered only when an NVIDIA GPU and lc0 pass the probe; otherwise Toby 2 Standard answers (said once, in the path line)",
+ "compute": {
+  "cuda": {
+   "runtime": "torch",
+   "dtype": "fp32",
+   "note": "the engine's default GPU path for B (TOBY2_FP16 unset)"
+  }
+ },
+ "head": {
+  "file": "toby2_lhead.pt",
+  "sha256": "d0c278bba6b87369f79e1cd8d89ba11227fdfd173734aeba52f001d2e78497da",
+  "format": "toby2-lhead/1",
+  "extra_move_inputs": 5,
+  "source_model": "/vol/v7/runs/B_t2open_distill_lhead_hall/model_99M.pt",
+  "source_model_sha256": "8accfe67b7546dbefdeffcf3997ce1605c070860d98769ace6d42cd8bc1217f4",
+  "size_bytes": 31111
+ },
+ "head_rule": {
+  "classical": "on",
+  "rapid_blitz": "off",
+  "rule": "sealed protocol 6.3 (rapid / blitz default written after decisions.json); option Leela Head = On / Off forces"
+ },
+ "leela": {
+  "lc0": "v0.32.1 CUDA build",
+  "lc0_sha256": {
+   "linux": "b2a4bb76a112cc9ddd556d61a151ac5724a220cabbe5c3eee35235a8703dc5cc",
+   "windows": null,
+   "macos": null
+  },
+  "lc0_sha256_rule": "per platform; null = not pinned there (the Windows package's official CUDA build, hash written by its build), the self-check still decides",
+  "network": "BT3-768x15x24h-swa-2790000.pb.gz",
+  "network_sha256": "e3067757d1fc2dfc66947b21d15ace0cedf4c54254fc1de83d77c378a3e8b8e1",
+  "nodes": 1024,
+  "backend": "cuda-fp16",
+  "backend_opts": "max_batch=256",
+  "position": "FEN only (leela_feats.lc0_fen: move number 1), tree reset before each search",
+  "complements": "none: unvisited moves masked (lvis 0)",
+  "features": "leela_feats.move_features (lshare, lq, lvis, lroot, lhas)",
+  "gpu": "any NVIDIA card whose lc0 passes the self-check below (no compute-capability list); the sealed test runs on A40",
+  "selfcheck": {
+   "what": "lc0 self-check of Toby 2 Accurate: 3 fixed dev positions and their stored training features (A40, lc0 0.32.1 + BT3, 1,024 nodes, cuda-fp16) of the visited moves; a card passes if, on every position, the search completes, its most visited move is the stored one, max |d visit share| <= tolerance over the legal moves and |d root WL| <= tolerance",
+   "tolerance": {
+    "max_abs_dshare": 0.1,
+    "max_abs_droot": 0.15,
+    "top_visited_same": true
+   },
+   "noise_reference": "A40, the engine's own lc0 path (one process), 5 searches per position: worst max |d share| against the stored features on the 3 chosen positions <= 0.0083; over 60 random dev positions median 0.0361, p95 0.1001",
+   "positions": [
+    {
+     "fen": "6k1/R1p1r1p1/1rqp1n1p/1p3N2/4P3/7P/1P3PP1/2Q1R1K1 b - - 3 1",
+     "key": "bc_Kp1NFu2V|49",
+     "root_wl": -0.156005859375,
+     "visited": {
+      "e7e8": [
+       0.0020656585693359375,
+       -0.9814453125,
+       1
+      ],
+      "e7f7": [
+       0.049591064453125,
+       -0.47265625,
+       1
+      ],
+      "e7d7": [
+       0.033050537109375,
+       -0.60595703125,
+       1
+      ],
+      "e7e5": [
+       0.0020656585693359375,
+       -0.9365234375,
+       1
+      ],
+      "e7e4": [
+       0.9111328125,
+       -0.11572265625,
+       1
+      ],
+      "c6c1": [
+       0.0020656585693359375,
+       -0.99658203125,
+       1
+      ]
+     },
+     "engine_noise_worst_of_runs": {
+      "max_abs_dshare": 0.00244140625,
+      "abs_droot": 0.010498046875,
+      "runs": 5
+     }
+    },
+    {
+     "fen": "r1b1k2r/p3ppbp/2pp2pn/4P2q/8/1N3N2/PPP2PPP/R1BQR1K1 b kq - 0 1",
+     "key": "bc_lN09WE2U|21",
+     "root_wl": -0.32373046875,
+     "visited": {
+      "c8g4": [
+       0.004974365234375,
+       -0.78125,
+       1
+      ],
+      "g7e5": [
+       0.014923095703125,
+       -0.94287109375,
+       1
+      ],
+      "h6f5": [
+       0.0016584396362304688,
+       -0.9130859375,
+       1
+      ],
+      "h6g4": [
+       0.0016584396362304688,
+       -0.93994140625,
+       1
+      ],
+      "e8g8": [
+       0.75439453125,
+       -0.285400390625,
+       1
+      ],
+      "d6e5": [
+       0.21728515625,
+       -0.384765625,
+       1
+      ],
+      "d6d5": [
+       0.004974365234375,
+       -0.76806640625,
+       1
+      ]
+     },
+     "engine_noise_worst_of_runs": {
+      "max_abs_dshare": 0.00634765625,
+      "abs_droot": 0.007080078125,
+      "runs": 5
+     }
+    },
+    {
+     "fen": "r4rk1/pb2qpbp/2p1pnp1/2N5/4P3/1B2B3/PPPQ2PP/2KR3R b - - 0 1",
+     "key": "bc_WEmY4sQ8|29",
+     "root_wl": -0.175048828125,
+     "visited": {
+      "f8e8": [
+       0.0020580291748046875,
+       -0.80908203125,
+       1
+      ],
+      "f8d8": [
+       0.0123443603515625,
+       -0.58642578125,
+       1
+      ],
+      "a8d8": [
+       0.0226287841796875,
+       -0.492919921875,
+       1
+      ],
+      "e7c7": [
+       0.0020580291748046875,
+       -0.740234375,
+       1
+      ],
+      "b7c8": [
+       0.0020580291748046875,
+       -0.8154296875,
+       1
+      ],
+      "f6g4": [
+       0.923828125,
+       -0.1480712890625,
+       1
+      ],
+      "a7a5": [
+       0.03497314453125,
+       -0.45458984375,
+       1
+      ]
+     },
+     "engine_noise_worst_of_runs": {
+      "max_abs_dshare": 0.00830078125,
+      "abs_droot": 0.0224609375,
+      "runs": 5
+     }
+    }
+   ],
+   "tolerance_reason": "share: ~12x the worst engine-path noise on these positions (0.0083 over 5 A40 runs, 0.016 in a later run); root WL: the A40 engine path reached 0.046 once, so 0.15 leaves room for another card's fp16 numerics; a broken backend or network fails by far"
+  },
+  "on_failure": "probe or self-check failed: Toby 2 Standard answers for the session (said once, path line); a later failed search: said, that move answered by B with Stockfish values (head off), lc0 not relaunched"
+ },
+ "variants": {
+  "classical": "T2A (head on); A-FB = Leela Head Off",
+  "rapid_blitz": "B-rb (head off) or H-rb (head on), rule 6.3"
+ },
+ "blunder_penalty": {
+  "classical": {
+   "form": "knots",
+   "knots_E": [
+    1550.0,
+    1850.0,
+    2125.0,
+    2400.0,
+    2650.0
+   ],
+   "knots_beta": [
+    3.2418179956405953e-13,
+    4.898071587653077e-13,
+    4.3423944476987887e-10,
+    0.019903741002718276,
+    0.044999999962398896
+   ],
+   "g": 1
+  },
+  "rule": "p'(m) proportional to p(m) exp(-beta(E) L(m)); L = ES(E, best value) - ES(E, v(m)) from the engine's Stockfish values (CLAUDE.md ES); l0 = 0; beta(E) = monotone PCHIP through (knots_E, knots_beta), flat outside the knots, g = 1 (no phase factor); W/D/L untouched; only with values; group classical only (rapid / blitz: no penalty)",
+  "report": "nn/reports/toby2_pass3_dev_fit.md (sections 6-9); protocol nn/PROTOCOL_TOBY2_PASS3_DRAFT.md sections 8-11",
+  "fit": "nn/pass3/fit_penalty.py --objective ll, even dev games, candidate g = 1 (T2A)"
+ },
+ "wdl_correction": {
+  "classical": {
+   "form": "sf_blend_gap",
+   "g0": 50.0,
+   "tau": 10.0,
+   "deepened_scale": 0.5,
+   "a": 0.939728760231548,
+   "b": 1.46765035774734,
+   "c": -0.050492271493576324
+  }
+ }
+}

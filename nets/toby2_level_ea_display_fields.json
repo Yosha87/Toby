@@ -1,0 +1,388 @@
+{
+ "model": "toby2-level-v1",
+ "applies_to": "nn/level_t2/lh/frozen_open_c/calibration.json (sha256 02472f1ae54dc4bb4fe41b18c781a923c53024025a9a6a986d5b602b7cdebb80)",
+ "decision": "Yosha 2026-11-22 (coordinator, claude/bold-meitner-p1kije): E_A display only, used only when no rating is known; E_R unchanged",
+ "formula": "E_A = coef . basis(x) with coef = ea_coef (in-game values) or ea_coef_review (review recipe), basis(r) = [1, r', (r'-1800)+, (r'-2200)+, (r'-2500)+], r' = x bounded to [1400, 2800], x and ea_tau / ea_mean / ea_sd as today; shown = clip(ea_mean + k (E_A - ea_mean), 1400, 2800) with k = ea_stretch (in-game) or ea_stretch_review (review); display '2500+' if shown >= ea_cap_high, 'under 1600' if shown < ea_cap_low, else the rounded shown value",
+ "groups": {
+  "classical": {
+   "ea_stretch": 1.15,
+   "ea_coef_review": [
+    768.8276840687234,
+    0.49418744125971037,
+    0.8551816868753532,
+    -0.4611398083056571,
+    -0.6026011855611854
+   ],
+   "ea_stretch_review": 1.2,
+   "ea_cap_high": 2500,
+   "ea_cap_low": 1600
+  },
+  "rapidblitz": {
+   "ea_stretch": 1.15,
+   "ea_coef_review": [
+    641.7567981605038,
+    0.6269408701470269,
+    0.4599742437303197,
+    -0.31818639753864525,
+    -0.3594497763127197
+   ],
+   "ea_stretch_review": 1.2,
+   "ea_cap_high": 2500,
+   "ea_cap_low": 1600
+  }
+ },
+ "test_vectors": [
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 1200,
+   "E_A": 1458.6406,
+   "shown": 1400,
+   "display": "under 1600"
+  },
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 1500,
+   "E_A": 1512.243,
+   "shown": 1426.3352,
+   "display": "under 1600"
+  },
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 1700,
+   "E_A": 1619.4476,
+   "shown": 1549.6205,
+   "display": "under 1600"
+  },
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 1900,
+   "E_A": 1790.0177,
+   "shown": 1745.7762,
+   "display": "1746"
+  },
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 2100,
+   "E_A": 2023.9532,
+   "shown": 2014.802,
+   "display": "2015"
+  },
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 2300,
+   "E_A": 2239.0375,
+   "shown": 2262.1489,
+   "display": "2262"
+  },
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 2450,
+   "E_A": 2386.2122,
+   "shown": 2431.3998,
+   "display": "2431"
+  },
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 2550,
+   "E_A": 2459.9268,
+   "shown": 2516.1716,
+   "display": "2500+"
+  },
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 2650,
+   "E_A": 2509.2395,
+   "shown": 2572.8812,
+   "display": "2500+"
+  },
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 2800,
+   "E_A": 2583.2086,
+   "shown": 2657.9457,
+   "display": "2500+"
+  },
+  {
+   "group": "classical",
+   "values": "in-game",
+   "x": 3000,
+   "E_A": 2583.2086,
+   "shown": 2657.9457,
+   "display": "2500+"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 1200,
+   "E_A": 1460.6901,
+   "shown": 1400,
+   "display": "under 1600"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 1500,
+   "E_A": 1510.1088,
+   "shown": 1400,
+   "display": "under 1600"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 1700,
+   "E_A": 1608.9463,
+   "shown": 1513.7433,
+   "display": "under 1600"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 1900,
+   "E_A": 1793.302,
+   "shown": 1734.9701,
+   "display": "1735"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 2100,
+   "E_A": 2063.1758,
+   "shown": 2058.8187,
+   "display": "2059"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 2300,
+   "E_A": 2286.9357,
+   "shown": 2327.3305,
+   "display": "2327"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 2450,
+   "E_A": 2420.1701,
+   "shown": 2487.2118,
+   "display": "2487"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 2550,
+   "E_A": 2478.8629,
+   "shown": 2557.6432,
+   "display": "2500+"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 2650,
+   "E_A": 2507.4257,
+   "shown": 2591.9186,
+   "display": "2500+"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 2800,
+   "E_A": 2550.27,
+   "shown": 2643.3317,
+   "display": "2500+"
+  },
+  {
+   "group": "classical",
+   "values": "review",
+   "x": 3000,
+   "E_A": 2550.27,
+   "shown": 2643.3317,
+   "display": "2500+"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 1200,
+   "E_A": 1501.2236,
+   "shown": 1400,
+   "display": "under 1600"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 1500,
+   "E_A": 1574.23,
+   "shown": 1480.2005,
+   "display": "under 1600"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 1700,
+   "E_A": 1720.2428,
+   "shown": 1648.1152,
+   "display": "1648"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 1900,
+   "E_A": 1892.229,
+   "shown": 1845.8994,
+   "display": "1846"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 2100,
+   "E_A": 2090.1888,
+   "shown": 2073.5532,
+   "display": "2074"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 2300,
+   "E_A": 2258.0528,
+   "shown": 2266.5967,
+   "display": "2267"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 2450,
+   "E_A": 2361.3789,
+   "shown": 2385.4218,
+   "display": "2385"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 2550,
+   "E_A": 2426.8197,
+   "shown": 2460.6787,
+   "display": "2461"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 2650,
+   "E_A": 2488.8172,
+   "shown": 2531.9758,
+   "display": "2500+"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 2800,
+   "E_A": 2581.8134,
+   "shown": 2638.9215,
+   "display": "2500+"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "in-game",
+   "x": 3000,
+   "E_A": 2581.8134,
+   "shown": 2638.9215,
+   "display": "2500+"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 1200,
+   "E_A": 1519.474,
+   "shown": 1400,
+   "display": "under 1600"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 1500,
+   "E_A": 1582.1681,
+   "shown": 1458.3831,
+   "display": "under 1600"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 1700,
+   "E_A": 1707.5563,
+   "shown": 1608.8489,
+   "display": "1609"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 1900,
+   "E_A": 1878.9419,
+   "shown": 1814.5116,
+   "display": "1815"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 2100,
+   "E_A": 2096.3249,
+   "shown": 2075.3713,
+   "display": "2075"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 2300,
+   "E_A": 2281.8893,
+   "shown": 2298.0485,
+   "display": "2298"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 2450,
+   "E_A": 2397.1986,
+   "shown": 2436.4197,
+   "display": "2436"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 2550,
+   "E_A": 2456.099,
+   "shown": 2507.1001,
+   "display": "2500+"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 2650,
+   "E_A": 2497.0269,
+   "shown": 2556.2136,
+   "display": "2500+"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 2800,
+   "E_A": 2558.4187,
+   "shown": 2629.8838,
+   "display": "2500+"
+  },
+  {
+   "group": "rapidblitz",
+   "values": "review",
+   "x": 3000,
+   "E_A": 2558.4187,
+   "shown": 2629.8838,
+   "display": "2500+"
+  }
+ ]
+}

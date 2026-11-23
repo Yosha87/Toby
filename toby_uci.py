@@ -45,7 +45,7 @@ sys.path.insert(0, str(HERE))
 from toby_rating_convert import from_fide, to_fide  # noqa: E402
 
 NAME = "Toby - The Oracle By Yosha"
-VERSION = "1.0"   # first release after the public beta (github.com/Yosha87/Toby, October 2026)
+VERSION = "2.0"   # public name "Toby 2", version 2.0 (Yosha, 2026-11-22) = internal 2.2.2: 2.2.1 (Toby 2.2 without Toby 1.0 / Maia) + the E_A display lines (the version Siby reads in toby_manifest.json and in Toby/VERSION)
 
 
 def detect_gui():
@@ -118,8 +118,77 @@ if os.name == "nt" and (sys.stdin is None or sys.stdout is None):   # windowed b
             sys.stdout = open(msvcrt.open_osfhandle(_k32.GetStdHandle(-11), os.O_WRONLY), "w", encoding="utf-8", buffering=1)
     except Exception:  # noqa: BLE001
         pass
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+def _quiet_sink():
+    """Where stray output goes when there is no console (PyInstaller windowed build): TOBY_LOG (a file, appended) or the null device."""
+    try:
+        return open(os.environ.get("TOBY_LOG") or os.devnull, "a", encoding="utf-8", buffering=1)
+    except Exception:  # noqa: BLE001
+        return open(os.devnull, "w", encoding="utf-8")
+
+
+def _stream_ok(f):
+    """A stream Python can really write to: not None, and its file descriptor open (a GUI-subsystem parent, e.g. a Tcl pipe from
+    pythonw / wish, can give the child an invalid or closed stderr handle)."""
+    if f is None:
+        return False
+    try:
+        os.fstat(f.fileno())
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class _SafeStream:
+    """stderr as seen by libraries (warnings, logging, tqdm, torch, Maia's 'loading checkpoint' prints): writes that fail are dropped and
+    the stream switches to the null device, so that no stray write can raise in a search thread."""
+
+    def __init__(self, f):
+        self._f = f
+
+    def write(self, x):
+        try:
+            return self._f.write(x)
+        except Exception:  # noqa: BLE001
+            try:
+                self._f = open(os.devnull, "w", encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                pass
+            return len(x) if isinstance(x, str) else 0
+
+    def flush(self):
+        try:
+            self._f.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def isatty(self):
+        return False
+
+    def __getattr__(self, k):
+        return getattr(self._f, k)
+
+
+if not _stream_ok(sys.stderr) or os.environ.get("TOBY_LOG"):   # windowed build or an invalid stderr; or the user asked for a log file
+    sys.stderr = _quiet_sink()
+    try:   # stray C-level output of libraries (lc0 is a separate process; torch / onnxruntime warnings) goes there too
+        os.dup2(sys.stderr.fileno(), 2)
+    except Exception:  # noqa: BLE001
+        pass
+    if os.name == "nt":   # child processes (Stockfish, lc0, nvidia-smi) inherit a valid stderr handle, not the invalid one
+        try:
+            import ctypes as _ct
+            import msvcrt as _ms
+            _ct.windll.kernel32.SetStdHandle(-12, _ct.c_void_p(_ms.get_osfhandle(sys.stderr.fileno())))
+        except Exception:  # noqa: BLE001
+            pass
+if not _stream_ok(sys.stdout):   # no UCI stream at all (started without pipes): never crash on a write
+    sys.stdout = _quiet_sink()
+sys.stderr = _SafeStream(sys.stderr)
+try:
+    import logging as _logging
+    _logging.raiseExceptions = False   # a failing log handler never raises into the engine
+except Exception:  # noqa: BLE001
+    pass
 REAL_OUT = sys.stdout  # the UCI stream; stray prints from libraries (Maia) go to stderr
 sys.stdout = sys.stderr
 lock = threading.Lock()
@@ -161,6 +230,7 @@ def play_lambda(E):
             return y0 + (y1 - y0) * (E - x0) / (x1 - x0)
     return 0.0
 LISTED = set()  # moves already listed to Nibbler in the current search
+T2_SHOWN = set()  # moves Toby 2 evaluated in the current search (Move Evaluations = Toby 2): all listed, also below 0.1 % (2.0.2)
 maia = None
 maia_ft = None   # Maia-3 fine-tuned on over-the-board classical games (nn/maia_ft/), used in Classical with the networks trained for it (see ft_on)
 MAIA_FT_PATH = os.environ.get("TOBY_MAIA_FT") or next((str(c) for c in (HERE / "maia" / "maia3-79m-ft-classical.pt", HERE / "nn" / "maia3_ft.pt")
@@ -192,6 +262,7 @@ def out(s):
         HEART["last"] = time.time()
         if s.startswith("bestmove"):
             HEART["t0"] = None
+            BEST_SENT[0] += 1
     if LOG:
         with open(LOG, "a", encoding="utf-8") as fh:
             fh.write(f"{_stamp()} < " + s + "\n")
@@ -281,6 +352,8 @@ def start_leela_for_search():
     in the background now, so that it loads while the search's Maia stage runs. Never at isready, never for 'toby likelihood' / 'dist' /
     batches (they never use Leela). The search itself waits for the same start (one lc0, one lock): the values are those of a cold start."""
     if lc0 is not None or LEELA_BROKEN or (_LEELA_STARTING[0] is not None and _LEELA_STARTING[0].is_alive()):
+        return
+    if t2_on():   # Toby 2: no Leela program at all (network B replaces Maia + lc0 for the move distribution)
         return
     target = preload_lc0 if calculator() == "Leela" else (preload_raw_policy if hybrid_on() else None)
     if target is not None:
@@ -395,9 +468,16 @@ def maia_args():
     """Maia-3 arguments: the released checkpoint given by TOBY_MAIA_WEIGHTS, shipped next to Toby (maia/maia3-79m.pt), or already in the
     Hugging Face cache is given directly, so that no request goes to the Hugging Face Hub (offline use, faster start); else Maia downloads it."""
     args = ["--model", "maia3-79m", "--device", maia_device(), "--no-use-amp"]
+    c = maia_checkpoint()
+    return args + ["--checkpoint", c] if c else args
+
+
+def maia_checkpoint():
+    """The released Maia-3 checkpoint maia_args gives (shipped next to Toby, TOBY_MAIA_WEIGHTS, or the Hugging Face cache), or None
+    (Maia would then download it). No torch import: usable at 'uci'."""
     for c in (os.environ.get("TOBY_MAIA_WEIGHTS"), HERE / "maia" / "maia3-79m.pt", HERE / "nn" / "maia3-79m.pt"):   # shipped with the package
         if c and Path(c).is_file():
-            return args + ["--checkpoint", str(c)]
+            return str(c)
     try:
         roots = [os.environ.get("HF_HUB_CACHE"), os.path.join(os.environ["HF_HOME"], "hub") if os.environ.get("HF_HOME") else None,
                  os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")]
@@ -405,10 +485,10 @@ def maia_args():
             if r:
                 snaps = sorted(Path(r, "models--UofTCSSLab--Maia3-79M", "snapshots").glob("*/maia3-79m.pt"), key=lambda q: q.stat().st_mtime)
                 if snaps:
-                    return args + ["--checkpoint", str(snaps[-1])]
+                    return str(snaps[-1])
     except Exception:  # noqa: BLE001
         pass
-    return args
+    return None
 
 
 def set_maia_threads(n):
@@ -452,6 +532,65 @@ def load_maia():
         ft_loaded.set()
 
 
+_MAIA_START = {"started": False, "lock": threading.Lock()}
+
+
+def _toby1_shipped():
+    """2.2.1: Toby 1.0 (Maia-3, the fine-tuned Maia and the Toby 1.0 engine) is part of this copy only if Maia-3's weights ship with it:
+    maia/maia3-79m.pt (or nn/maia3-79m.pt) next to Toby, or TOBY_MAIA_WEIGHTS. A Maia-3 found only in the user's Hugging Face cache does
+    not count. TOBY_TOBY1=0 / 1 forces it (development). False: no code path loads Maia (Toby 2 answers everything, said)."""
+    v = os.environ.get("TOBY_TOBY1")
+    if v in ("0", "1"):
+        return v == "1"
+    for c in (os.environ.get("TOBY_MAIA_WEIGHTS"), HERE / "maia" / "maia3-79m.pt", HERE / "nn" / "maia3-79m.pt"):
+        if c and Path(c).is_file():
+            return True
+    return False
+
+
+TOBY1_SHIPPED = _toby1_shipped()
+T1_ANSWERS = "Toby 1.0 answers" if TOBY1_SHIPPED else "fallback answer below (no Toby 1.0 in this Toby)"
+TOBY1_ABSENT = "Toby 1.0 is not shipped with this Toby (Maia-3 left out): use 'toby level'"
+
+
+def ensure_maia():
+    """Starts loading Maia-3 (and then the fine-tuned Maia) in the background, once per process. Since 2.0.2 Maia is loaded only when
+    something uses it: 'toby likelihood' / 'toby batch' (Siby's level estimate), a Toby 1.0 search, or a Toby 2 search with a Toby 1.0
+    module (Move Evaluations = Toby 1.0, Position Evaluation = Toby 1.0 / Mix, Candidates = Maia C). A Toby 2 search with the default
+    options never uses Maia. Whoever needs Maia then waits on `ready` (set when the loading ends, loaded or failed)."""
+    global load_error
+    with _MAIA_START["lock"]:
+        if _MAIA_START["started"]:
+            return
+        _MAIA_START["started"] = True
+    if not TOBY1_SHIPPED:   # never loads Maia: whoever waits on `ready` sees maia = None at once (load_error says why)
+        load_error = TOBY1_ABSENT
+        ready.set()
+        ft_loaded.set()
+        return
+    threading.Thread(target=load_maia, daemon=True).start()
+
+
+def maia_wanted():
+    """True when the current options make the next search use Maia (see ensure_maia); 'toby likelihood' asks for it itself."""
+    if not TOBY1_SHIPPED:
+        return False
+    if os.environ.get("TOBY_MAIA_EAGER") == "1" or not t2_on():
+        return True
+    cand_maia = opts["t2_candidates"] == "Maia C" and (opts.get("t2_candidates_set") or T2.get("cfg") is not None
+                                                       or t2_config_path() is None)
+    return opts["t2_move_evals"] == "Toby 1.0" or opts["t2_position_eval"] in ("Toby 1.0", "Mix") or cand_maia
+
+
+def wait_maia(ft=False, timeout=None):
+    """ensure_maia, then wait for the loading (and for the fine-tuned Maia when ft and Classical wants it)."""
+    ensure_maia()
+    if not ready.is_set():
+        ready.wait(timeout)   # timeout: a Toby 2 search with a Toby 1.0 module waits at most this long (then the module is Off, said)
+    if ft:
+        wait_maia_ft()
+
+
 def wait_maia_ft():
     """Classical with the fine-tuned Maia installed and wanted: wait (at most 3 min) until it is loaded, so that the very first moves already use it."""
     if opts["mode"] == "Classical" and opts.get("maia_ft", True) and os.path.exists(MAIA_FT_PATH) and not ft_loaded.is_set():
@@ -482,6 +621,80 @@ def _load_maia_ft(torch, Maia3UCIEngine, parse_args, get_legal_moves_mask):
 
 
 _FT = threading.local()   # _FT.force: True / False overrides ft_on() in this thread (the likelihood command uses the Stockfish network whatever the calculator)
+
+
+# ---------------------------------------------------------------------------------------------- reused worker threads (2.2.1, Windows leak)
+# On Windows, each new OS thread that runs torch keeps native per-thread buffers after it ends (Siby, 2026-11-21: ~8.6 MB of private
+# bytes per 'toby level move', never released; flat on Linux). Every command and every search used to start new threads (here and in
+# toby2.py). PooledThread has threading.Thread's interface (start / join / is_alive / daemon / name) but runs its target on a worker
+# thread that is kept and reused, so the number of OS threads stays at the peak concurrency. The targets, their order and their
+# results are unchanged; the worker's thread-local state (_MUTE, _FT) is cleared after each job. Default on Windows only (below).
+_POOL_LOCK = threading.Lock()
+_POOL_IDLE = []
+
+
+class _PoolWorker(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True, name="toby-pool")
+        self.jobs = queue.SimpleQueue()
+        self.start()
+
+    def run(self):
+        while True:
+            job = self.jobs.get()
+            try:
+                job._run()
+            finally:
+                for tl in (_MUTE, _FT):
+                    tl.__dict__.clear()
+                with _POOL_LOCK:   # idle again BEFORE the job reads as finished: a start() right after join() reuses this worker
+                    _POOL_IDLE.append(self)
+                job._done.set()
+
+
+class PooledThread:
+    """threading.Thread look-alike whose target runs on a reused worker thread (see above)."""
+
+    def __init__(self, group=None, target=None, name=None, args=(), kwargs=None, *, daemon=None):
+        self._target, self._args, self._kwargs = target, tuple(args), dict(kwargs or {})
+        self._done, self._started = threading.Event(), False
+        self.name, self.daemon = name or "pooled", True if daemon is None else daemon
+
+    def start(self):
+        if self._started:
+            raise RuntimeError("threads can only be started once")
+        self._started = True
+        with _POOL_LOCK:
+            w = _POOL_IDLE.pop() if _POOL_IDLE else None
+        (w or _PoolWorker()).jobs.put(self)
+
+    def _run(self):
+        try:
+            if self._target is not None:
+                self._target(*self._args, **self._kwargs)
+        except BaseException:  # noqa: BLE001   (as threading.Thread: the traceback goes to stderr, the worker lives on)
+            import traceback
+            traceback.print_exc()
+
+    def join(self, timeout=None):
+        if not self._started:
+            raise RuntimeError("cannot join thread before it is started")
+        self._done.wait(timeout)
+
+    def is_alive(self):
+        return self._started and not self._done.is_set()
+
+
+# default: on Windows only (Linux keeps 2.2's plain threads: no leak there, and the reused threads hold ~100 MB more of malloc arenas, measured
+# on 400 go / stop cycles); TOBY_THREAD_POOL=1 / 0 forces it
+WThread = PooledThread if os.environ.get("TOBY_THREAD_POOL", "1" if os.name == "nt" else "0") != "0" else threading.Thread
+
+
+class _ThreadingForToby2:
+    """The `threading` module as toby2.py sees it: the same module, with Thread = WThread (toby2.py's file is unchanged)."""
+
+    def __getattr__(self, k):
+        return WThread if k == "Thread" else getattr(threading, k)
 
 
 def ft_on():
@@ -795,11 +1008,15 @@ def lc0_backend_file():
 class Lc0:
     """Thin wrapper around an lc0 process (UCI, --verbose-move-stats)."""
 
-    def __init__(self, light=False):
+    def __init__(self, light=False, backend=None, start_timeout=None, search_timeout=None):
         global _JOB
+        self.start_timeout, self.search_timeout = start_timeout, search_timeout   # Toby 2 Accurate: short, fixed (never a long first answer)
+        self.pgroup = os.name != "nt" and start_timeout is not None
+        self.stop_event = None   # None: searches obey the UCI stop flag; an Event: they obey it instead (the Accurate probe's self-check)
         self._io = threading.RLock()   # one exchange with lc0 at a time (search, static_values, new_game)
         self.light = light
-        backend = lc0_backend()   # no NVIDIA GPU, no file: lc0's own default
+        backend = backend or lc0_backend()   # no NVIDIA GPU, no file: lc0's own default (Toby 2 Accurate passes its product's backend)
+        self.backend = backend
         extra = os.environ.get("TOBY_LC0_EXTRA", "").split()
         has = lambda o: any(x.split("=")[0] == o for x in extra)
         if light:   # one-node evaluations only (Fast's raw policy): one search thread, no batching or prefetch, a tiny cache
@@ -813,7 +1030,8 @@ class Lc0:
         self.p = subprocess.Popen([LC0, f"--weights={NET}"] + (["--backend=" + backend] if backend else []) + ["--verbose-move-stats"]
                                   + extra, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))   # Windows: no console window for lc0 when the GUI has none
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),   # Windows: no console window for lc0 when the GUI has none
+                                  start_new_session=self.pgroup)   # Toby 2: own process group, so that the watchdog kills a wrapper's children too
         _LC0_PROCS.append(self)
         match_priority(self.p.pid)
         if os.name == "nt":
@@ -836,7 +1054,17 @@ class Lc0:
     def _watchdog(self, seconds):
         """Kill lc0 if the current exchange is not over after `seconds` (a GPU that hangs instead of failing): the reading loop then ends
         and the caller raises, so Toby never waits forever."""
-        t = threading.Timer(seconds, lambda: self.p.poll() is None and self.p.kill())
+        def _kill():
+            if getattr(self, "pgroup", False):   # the whole group: a process left holding lc0's output pipe would block the reader forever
+                try:
+                    import signal
+                    os.killpg(self.p.pid, signal.SIGKILL)
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.p.poll() is None:
+                self.p.kill()
+        t = threading.Timer(seconds, _kill)
         t.daemon = True
         t.start()
         return t
@@ -844,7 +1072,7 @@ class Lc0:
     def wait(self, token):
         # starting lc0 and loading the network: up to 300 s on a GPU (first CUDA start), 60 s otherwise (a CPU lc0 loads BT3 in seconds;
         # a GPU build without a usable GPU must fail fast)
-        dog = self._watchdog(float(os.environ.get("TOBY_LC0_START_TIMEOUT", "300" if (HAS_NVIDIA and lc0_on_gpu()) else "60")))
+        dog = self._watchdog(self.start_timeout or float(os.environ.get("TOBY_LC0_START_TIMEOUT", "300" if (HAS_NVIDIA and lc0_on_gpu()) else "60")))
         try:
             self._wait(token)
         finally:
@@ -881,9 +1109,11 @@ class Lc0:
         moves, root, pol = {}, None, {}
         finished = threading.Event()
 
+        stop = self.stop_event or stop_flag   # the Accurate probe passes its own event: 'ucinewgame' / 'stop' set the UCI flag, not this one
+
         def watch():  # the GUI's stop reaches lc0 at once: the partial result is discarded by the caller, which checks the flag
             while not finished.is_set():
-                if stop_flag.wait(0.02):
+                if stop.wait(0.02):
                     if not finished.is_set():
                         try:
                             self.send("stop")
@@ -892,7 +1122,7 @@ class Lc0:
                     return
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
-        dog = self._watchdog(float(os.environ.get("TOBY_LC0_SEARCH_TIMEOUT", "120" if nodes <= 1 else "600")))
+        dog = self._watchdog(self.search_timeout or float(os.environ.get("TOBY_LC0_SEARCH_TIMEOUT", "120" if nodes <= 1 else "600")))
         got_best = False
         for line in self.p.stdout:
             if line.startswith("bestmove"):
@@ -992,16 +1222,21 @@ CALCULATORS = ["Auto", "Leela", "Stockfish"]
 # Leela with the history network and Stockfish complements (L-Leela); everywhere else (Rapid, Blitz, or no NVIDIA GPU): the Stockfish calculator (L-SF).
 # Without Stockfish or its networks, Auto falls back to Leela with the network v1 (the previous default).
 def _nvidia_ok():
-    """An NVIDIA GPU that answers: nvidia-smi present AND listing a GPU (a driver installed but not loaded must not send Toby to Leela)."""
-    exe = shutil.which("nvidia-smi")
-    if not exe:
-        return False
+    """An NVIDIA GPU that answers: nvidia-smi present AND listing a GPU (a driver installed but not loaded must not send Toby to Leela).
+    Through toby2.nvidia_smi: one call per process, shared with Toby 2's GPU probe, output to a file and a hard wall-clock limit with the
+    whole process tree killed (a hanging nvidia-smi or .bat wrapper cannot block the engine). `nvidia-smi -L` only when the card query
+    itself is refused (a driver too old for compute_cap)."""
     try:
-        r = subprocess.run([exe, "-L"], capture_output=True, text=True, timeout=10,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return r.returncode == 0 and "GPU" in r.stdout
+        import toby2 as _t2
     except Exception:  # noqa: BLE001
         return False
+    if _t2.nvidia_rows():
+        return True
+    rc, _txt, err = _t2.nvidia_smi()
+    if err:   # missing, failed to start or did not answer in time: no second call
+        return False
+    rc, txt, err = _t2.nvidia_smi(("-L",))
+    return not err and rc == 0 and "GPU" in txt
 
 
 HAS_NVIDIA = os.environ.get("TOBY_GPU", "1" if _nvidia_ok() else "0") == "1"
@@ -1188,6 +1423,7 @@ class StockfishCalc:
         first: the answer depends on the position only, not on which engine got it or what it searched before."""
         import chess.engine
         kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
+        kw["stderr"] = subprocess.DEVNULL   # never the GUI's stderr handle (may be invalid: a GUI-subsystem parent without redirect)
         self.eng = chess.engine.SimpleEngine.popen_uci(SF_PATH, **kw)
         try:
             match_priority(self.eng.protocol.transport.get_pid())
@@ -1205,11 +1441,12 @@ class StockfishCalc:
             self.eng.configure({"Threads": t, "Hash": 64 * t})
             self.threads = t
 
-    def evaluate(self, b, nodes):
+    def evaluate(self, b, nodes, on_depth=None):
         """{uci: centipawns for the side to move (mates +-10000)} of every legal move, from the deepest iteration COMPLETED within the node budget
         (the training data are read the same way: nn/dataset.at_budget); None if stopped before the end. The details of the last call
         (depth, nodes, mate distances, principal variations) are in self.last. Answers are cached (SF_CACHE: the position, the last 8 moves,
-        the node budget, the threads; also on disk with TOBY_SF_CACHE_FILE)."""
+        the node budget, the threads; also on disk with TOBY_SF_CACHE_FILE). on_depth(d, {uci: cp}): called during the search each time an
+        iteration of depth >= 8 has a value for every legal move (pass-1 streaming, Toby 2's speculative complements); the result is unchanged."""
         import chess.engine
         self.configure()
         key = sf_cache_key(b, nodes, self.threads, self.eng.id.get("name", ""))
@@ -1237,6 +1474,11 @@ class StockfishCalc:
                         nod[d] = max(nod.get(d, 0), info.get("nodes", 0))
                         mates.setdefault(d, {})[u] = sc.mate() if sc.is_mate() else None
                         pvs.setdefault(d, {})[u] = " ".join(m.uci() for m in info["pv"][:12])
+                        if on_depth is not None and len(per[d]) == n:
+                            try:
+                                on_depth(d, dict(per[d]))
+                            except Exception:  # noqa: BLE001
+                                pass
         full = [d for d, v in per.items() if len(v) == n]   # depths where every legal move has a value (nn/dataset.at_budget)
         done = [d for d in full if nod[d] <= nodes]
         if full:   # the deepest completed within the budget, else the shallowest completed one
@@ -1250,7 +1492,7 @@ class StockfishCalc:
         SF_CACHE.put(key, (dict(res), self.last))
         return dict(res)
 
-    def extend(self, b, moves, nodes):
+    def extend(self, b, moves, nodes, cancel=None):
         """EXPERIMENTAL (V2): {uci: cp} of a search on the given moves only (MultiPV over them, hash cleared, final values), as
         nn/sf_adaptive/pilot.search. Cached like evaluate (the moves, in their order, are part of the key)."""
         import chess.engine
@@ -1265,7 +1507,17 @@ class StockfishCalc:
             return None
         self.eng.configure({"Clear Hash": None})
         mv = [chess.Move.from_uci(m) for m in moves]
-        infos = self.eng.analyse(chess.Board(b.fen()), chess.engine.Limit(nodes=nodes), multipv=len(mv), root_moves=mv, game=object())   # FEN only, as the data
+        if cancel is None:
+            infos = self.eng.analyse(chess.Board(b.fen()), chess.engine.Limit(nodes=nodes), multipv=len(mv), root_moves=mv, game=object())   # FEN only, as the data
+        else:   # cancellable (Toby 2's speculative complements): the same search; analyse() is analysis() + wait() + multipv
+            with self.eng.analysis(chess.Board(b.fen()), chess.engine.Limit(nodes=nodes), multipv=len(mv), root_moves=mv, game=object()) as an:
+                for _ in an:
+                    if cancel.is_set():
+                        an.stop()
+                        return None
+                infos = an.multipv
+            if cancel.is_set():
+                return None
         res = {}
         for i in infos:
             if "pv" in i and i["pv"] and "score" in i:
@@ -1496,6 +1748,59 @@ def n_cores():
         return os.cpu_count() or 1
 
 
+def _cgroup_cpu_quota():
+    """The container's CPU quota in cores (cgroup v2 cpu.max, or v1 cpu.cfs_quota_us / cpu.cfs_period_us), or None when there is none."""
+    paths = []
+    try:
+        for line in Path("/proc/self/cgroup").read_text().splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[0] == "0" and parts[1] == "":   # cgroup v2: "0::/path"
+                paths.append(Path("/sys/fs/cgroup") / parts[2].lstrip("/") / "cpu.max")
+    except Exception:  # noqa: BLE001
+        pass
+    paths.append(Path("/sys/fs/cgroup/cpu.max"))
+    for f in paths:
+        try:
+            q, p = f.read_text().split()[:2]
+            if q != "max" and int(p) > 0:
+                return int(q) / int(p)
+            if q == "max":
+                return None
+        except Exception:  # noqa: BLE001
+            continue
+    for d in ("/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"):
+        try:
+            q = int(Path(d, "cpu.cfs_quota_us").read_text())
+            p = int(Path(d, "cpu.cfs_period_us").read_text())
+            if q > 0 and p > 0:
+                return q / p
+            return None
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+_USABLE = []
+
+
+def usable_cores():
+    """Cores this process can really use (cached): the CPUs it may run on (sched_getaffinity), capped by the container's CPU quota if
+    there is one (RunPod's A40 pods show 96 CPUs with a quota of 7.65 cores). Used only to decide the optional parallel work below;
+    n_cores() (affinity only) still decides the thread counts, which must not change."""
+    if not _USABLE:
+        n = float(n_cores())
+        q = _cgroup_cpu_quota()
+        _USABLE.append(min(n, q) if q else n)
+    return _USABLE[0]
+
+
+def t2_cores_used():
+    """Cores a Toby 2 search already keeps busy: B's torch threads, Stockfish pass 1 and the second Stockfish, and lc0 for the Leela head."""
+    th = opts["t2_threads"] or (2 if n_cores() >= 4 else 1)
+    cfg = T2.get("cfg") or {}
+    return th + 2 + (1 if cfg.get("head") else 0)
+
+
 _SPEC = {"eng": None, "busy": threading.Lock()}
 
 
@@ -1539,7 +1844,7 @@ def sf_v2(b, pm, base=None, eng=None, spec=None, pre=None, info=None):
                 pass
             finally:
                 _SPEC["busy"].release()
-        th = threading.Thread(target=_run, daemon=True)
+        th = WThread(target=_run, daemon=True)
         th.start()
     if base is None:
         base = eng.evaluate(b, V2_BASE)
@@ -1726,17 +2031,25 @@ def eval_elo(E, x):
 _MV = {}
 
 
-def maia_values_batch(boards, elo, oppo=None, allpol=False):
-    """Maia's value of several positions in one pass of the network (the engine's evaluation of every shown move); results go to the cache.
-    With the option Endgame Evaluation, the policy stats of the same pass are kept too (positions where the correction applies)."""
+def _maia_values_plan(boards, elo, oppo=None, allpol=False):
+    """What maia_values_batch computes now: (todo = the boards not cached, in their order; pol; need) for the current caches and options."""
     we = wdl_endgame(None)
     pol = we is not None and we[1] == "valpass"
     need = (lambda c: allpol or _WE.applies(c.fen())) if pol else (lambda c: False)   # allpol: candidate M's Q reads every position's stats
     todo = [c for c in boards if (c.fen(), elo, oppo) not in _MV or (need(c) and (c.fen(), elo, oppo) not in _MVP)]
-    if not todo or maia is None:
-        return
+    return todo, pol, need
+
+
+def _maia_values_key(todo, elo, oppo, pol, need):
+    """Identity of one Maia value pass: every board in full (root position and moves, in the batch order), both ratings and what is kept."""
+    return (tuple((c.root().fen(), tuple(m.uci() for m in c.move_stack)) for c in todo), elo, oppo, pol, tuple(bool(need(c)) for c in todo))
+
+
+def _maia_values_run(todo, elo, oppo, pol, need):
+    """The network pass of maia_values_batch on exactly `todo` (one batch): (values [l, d, w] per board, {key: policy stats})."""
     eng, torch, _ = maia
     cfg = eng.cfg
+    mvp = {}
     with MAIA_LOCK, torch.no_grad():
         toks = []
         for c in todo:
@@ -1748,11 +2061,27 @@ def maia_values_batch(boards, elo, oppo=None, allpol=False):
         lm, v, _ = eng.model(torch.stack(toks).to(cfg.device), se, so)
         vals = torch.softmax(v.float(), dim=-1).tolist()
         if pol:
-            if len(_MVP) > 4000:
-                _MVP.clear()
             for i, c in enumerate(todo):
                 if need(c):
-                    _MVP[(c.fen(), elo, oppo)] = _valpass_policy(lm[i], c)
+                    mvp[(c.fen(), elo, oppo)] = _valpass_policy(lm[i], c)
+    return vals, mvp
+
+
+def maia_values_batch(boards, elo, oppo=None, allpol=False):
+    """Maia's value of several positions in one pass of the network (the engine's evaluation of every shown move); results go to the cache.
+    With the option Endgame Evaluation, the policy stats of the same pass are kept too (positions where the correction applies).
+    A pass of exactly the same batch already made by the Move Evaluations prefetch (EvalPrefetch) is used instead of a new one: same
+    boards in the same order, same ratings, so the same numbers."""
+    todo, pol, need = _maia_values_plan(boards, elo, oppo, allpol)
+    if not todo or maia is None:
+        return
+    pre = _EVPRE[0]
+    got = pre.take_batch(_maia_values_key(todo, elo, oppo, pol, need)) if pre is not None else None
+    vals, mvp = got if got is not None else _maia_values_run(todo, elo, oppo, pol, need)
+    if pol:
+        if len(_MVP) > 4000:
+            _MVP.clear()
+        _MVP.update(mvp)
     if len(_MV) > 4000:
         _MV.clear()
     for c, w in zip(todo, vals):
@@ -1764,8 +2093,77 @@ def maia_value_cached(board, elo, oppo=None):
     if k not in _MV:
         if len(_MV) > 4000:
             _MV.clear()
-        _MV[k] = maia_value(board, elo, oppo)
+        pre = _EVPRE[0]
+        got = pre.take_single(board, elo, oppo) if pre is not None else None   # the same single pass, made by the prefetch
+        _MV[k] = got if got is not None else maia_value(board, elo, oppo)
     return _MV[k]
+
+
+def _board_id(b):
+    return (b.root().fen(), tuple(m.uci() for m in b.move_stack))
+
+
+class EvalPrefetch:
+    """Toby 2's Move Evaluations prefetch: Maia's value passes of the final stage, made while the Stockfish complements run.
+    When Stockfish pass 1 is done, B's heads on the pass-1 values give a provisional distribution; its shown moves give the batch that
+    toby_evals would send to maia_values_batch, and that batch is computed now, followed by the position's own single value pass.
+    The final stage uses a prefetched pass ONLY when it would make exactly the same pass: the same boards (root position and moves) in
+    the same order, with the same ratings and the same policy statistics kept (batch), or the same board and ratings (single). The
+    network is deterministic for the same inputs, so the numbers are those the final stage would compute; any other case computes as
+    before. Output-identical by construction; it changes only when the work is done."""
+
+    def __init__(self):
+        self.planned = threading.Event()   # the batch key is known (or the prefetch gave up)
+        self.done = threading.Event()      # the batch pass is finished
+        self.single_done = threading.Event()
+        self.key = None                    # _maia_values_key of the prefetched batch
+        self.batch = None
+        self.single_key = None             # (board id, elo, oppo) of the prefetched single pass
+        self.single = None                 # its [l, d, w]
+        self.th = None
+        self.stats = {"batch_hit": 0.0, "single_hit": 0.0}
+
+    def start(self, fn):
+        def _run():
+            try:
+                fn(self)
+            except Exception:  # noqa: BLE001   (a failed prefetch only means the final stage computes everything itself)
+                pass
+            finally:
+                self.planned.set()
+                self.done.set()
+                self.single_done.set()
+        self.th = WThread(target=_run, daemon=True)
+        self.th.start()
+
+    def take_batch(self, key):
+        if self.th is None:
+            return None
+        self.planned.wait(5.0)
+        if self.key is None or key != self.key:
+            return None
+        self.done.wait(5.0)
+        if self.batch is None or not self.done.is_set():
+            return None
+        self.stats["batch_hit"] = 1.0
+        b, self.batch = self.batch, None
+        return b
+
+    def take_single(self, board, elo, oppo):
+        if self.th is None:
+            return None
+        self.planned.wait(5.0)
+        if self.single_key is None or (_board_id(board), elo, oppo) != self.single_key:
+            return None
+        self.single_done.wait(5.0)
+        v, self.single = self.single, None
+        if v is not None and self.single_done.is_set():
+            self.stats["single_hit"] = 1.0
+            return v
+        return None
+
+
+_EVPRE = [None]   # the current search's EvalPrefetch (Toby 2), or None
 
 
 ENDGAME_CANDIDATES = ["P1a", "P1b", "P1c", "P1d", "P2a", "P2c", "M"]   # nn/wdl_ext_params_v4.json (protocol NN v6, amendments 6-6e, 8)
@@ -1790,7 +2188,7 @@ def mix_on():
 
 def mix_q(src, opp):
     """The terms Q of candidate M (Classical, Fast, both ratings given), else None."""
-    if not (mix_on() and src == "sf" and opp and opts["mode"] == "Classical"):
+    if not (mix_on() and src == "sf" and opp and opts["mode"] == "Classical") or wdl_endgame(None) is None:   # Q reads the endgame module's policy stats
         return None
     if not _MIXQ:
         try:
@@ -1838,8 +2236,10 @@ def wdl_endgame(path="sf", opp=False):
             import wdl_endgame_p1 as _m
             _m.load_params(str(HERE / "nn" / ENDGAME_PARAMS), default=True)
             _WE = _m
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             _WE = False
+            out(f"info string Toby: Endgame Evaluation unavailable ({type(exc).__name__}: {exc}): Toby 1.0's evaluations without it "
+                "(reinstall Toby)")
     if not _WE:
         return None
     cand = _WE.load_params()["candidates"].get(c)
@@ -1884,6 +2284,32 @@ def endgame_policy(board, E, ev, kind, root, ev_other=None, E_other=None):
     return max(pm.values()) / z, -sum((v / z) * math.log(v / z) for v in pm.values() if v > 0)
 
 
+def evals_batch(b, moves, we, qp, ev_elo, ev_opp, opp):
+    """The arguments of toby_evals' single Maia value pass: (every position after a listed move that does not end the game, + the
+    position itself when Endgame Evaluation applies to it; the ratings; allpol)."""
+    after = []
+    for u in moves:
+        c = b.copy(stack=False)
+        c.push(chess.Move.from_uci(u))
+        if not c.is_game_over():
+            after.append(c)
+    if we and not opp and we[0].applies(b.fen()):   # Endgame Evaluation: the position itself in the same batch (same ratings)
+        after.append(b)
+    return after, ev_opp if opp else ev_elo, ev_elo if opp else None, qp is not None
+
+
+def evals_setup(E, x, opp, consts, src):
+    """toby_evals' ratings and options for its Maia passes: (ev_elo, ev_opp, we, qp), exactly as toby_evals computes them."""
+    ev_elo = eval_elo(E, x)
+    ev_opp = eval_elo(opp[0], opp[1]) if opp else None
+    we = wdl_endgame("sf" if (consts or src == "sf") else "leela", opp is not None)
+    cb = endgame_base("sf" if (consts or src == "sf") else "leela", opp is not None)
+    if cb is not None and not opp:
+        consts = cb
+    qp = mix_q("sf" if (consts or src == "sf") else "leela", opp is not None)
+    return ev_elo, ev_opp, we, qp
+
+
 def toby_evals(b, E, x, moves, lee, extra, root, deadline, opp=None, consts=None, src="leela", dist=None):
     """Toby's evaluation of each move, from the point of view of the player who plays it: {uci: (WL, D)} with WL = win - loss, plus that of the position itself.
     The position after the move is evaluated for the side that must play there (the opponent), where the model is calibrated, then flipped.
@@ -1900,15 +2326,7 @@ def toby_evals(b, E, x, moves, lee, extra, root, deadline, opp=None, consts=None
     E_o = opp[0] if opp else E   # strength of the side to move after a move
     qp = mix_q("sf" if (consts or src == "sf") else "leela", opp is not None)   # candidate M: the terms Q (else None)
     try:   # every position after a move in one batch (same values as one by one, much faster on a CPU)
-        after = []
-        for u in moves:
-            c = b.copy(stack=False)
-            c.push(chess.Move.from_uci(u))
-            if not c.is_game_over():
-                after.append(c)
-        if we and not opp and we[0].applies(b.fen()):   # Endgame Evaluation: the position itself in the same batch (same ratings)
-            after.append(b)
-        maia_values_batch(after, ev_opp if opp else ev_elo, ev_elo if opp else None, allpol=qp is not None)
+        maia_values_batch(*evals_batch(b, moves, we, qp, ev_elo, ev_opp, opp))
     except Exception:  # noqa: BLE001
         pass
 
@@ -1995,7 +2413,7 @@ def emit(stage, dist, lee, extra, root, nodes, t0, provisional, evals=None, root
     if evals:
         EV_LAST.update(evals)   # a move keeps its last evaluation when a stage does not re-evaluate it: every listed move then has its WDL line in the same block (Nibbler sorts the moves that were in the latest block first)
     items = sorted(dist.items(), key=lambda kv: -kv[1])
-    keep = [(u, p) for u, p in items if p >= 0.001 or (fmt == "Nibbler" and u in LISTED)] or items[:1]
+    keep = [(u, p) for u, p in items if p >= 0.001 or u in T2_SHOWN or (fmt == "Nibbler" and u in LISTED)] or items[:1]
     if fmt == "Nibbler":   # a move listed at an earlier stage stays listed (with its new, smaller number): Nibbler keeps the old row, greyed, under the latest block otherwise
         LISTED.update(u for u, _ in keep)
     items = keep if fmt == "Nibbler" else keep[:int(opts["MultiPV"])]  # Nibbler sends its own MultiPV (3): ignored, every move above 0.1% is shown, like Leela
@@ -2198,6 +2616,36 @@ def go_clock(t, turn):
     return (w, bl) if turn == chess.WHITE else (bl, w)
 
 
+BEST_SENT = [0]   # number of bestmove lines sent (search_guarded)
+
+
+def search_guarded(movetime, infinite=False):
+    """The search thread: any exception is said in an info string and the search still ends with a bestmove (the most probable move
+    known, else the first legal move): a GUI never waits forever."""
+    n0 = BEST_SENT[0]
+    try:
+        search(movetime, infinite)
+    except BaseException as exc:  # noqa: BLE001
+        try:
+            import traceback
+            where = traceback.extract_tb(exc.__traceback__)[-1]
+            where = f" at {Path(where.filename).name}:{where.lineno}"
+        except Exception:  # noqa: BLE001
+            where = ""
+        try:
+            out(f"info string Toby ERROR: the search failed ({type(exc).__name__}: {exc}{where})")
+        except Exception:  # noqa: BLE001
+            pass
+        if BEST_SENT[0] == n0:
+            try:
+                b = board.copy()
+                legal = [m.uci() for m in b.legal_moves]
+                cand = [u for u, _ in sorted(PRIOR.items(), key=lambda kv: -kv[1]) if u in legal]
+                out(f"bestmove {(cand or legal or ['0000'])[0]}")
+            except Exception:  # noqa: BLE001
+                out("bestmove 0000")
+
+
 def search(movetime, infinite=False):
     """movetime = time budget in seconds (time_budget) or None: no limit (analysis)."""
     timer = None
@@ -2227,7 +2675,7 @@ DEEPEN_W = _deepen_w()
 def evaluate_position(b):
     """Toby's displayed line of position b (W - L, D for its side to move), the engine's own final answer with b's history and the current
     options, computed silently (option Deepening). None if stopped or no line."""
-    saved = (dict(PRIOR), dict(EV_LAST), list(ROOT_LAST), set(LISTED), EVAL_K[0], dict(PLAY_LOSS))
+    saved = (dict(PRIOR), dict(EV_LAST), list(ROOT_LAST), set(LISTED), EVAL_K[0], dict(PLAY_LOSS), set(T2_SHOWN))
     prec = (opts.get("hybrid"), opts["calculator"])
     opts["hybrid"], opts["calculator"] = True, "Stockfish"   # the next positions are evaluated in Fast (hybrid), also under Accurate (Yosha, 10 Nov)
     _MUTE.on, _MUTE.capture = True, []
@@ -2242,6 +2690,7 @@ def evaluate_position(b):
             opts["hybrid"], opts["calculator"] = prec
         PRIOR.clear(); PRIOR.update(saved[0]); EV_LAST.clear(); EV_LAST.update(saved[1]); ROOT_LAST[:] = saved[2]
         LISTED.clear(); LISTED.update(saved[3]); EVAL_K[0] = saved[4]; PLAY_LOSS.clear(); PLAY_LOSS.update(saved[5])
+        T2_SHOWN.clear(); T2_SHOWN.update(saved[6])
 
 
 def deepen(b, dist, t0):
@@ -2252,21 +2701,37 @@ def deepen(b, dist, t0):
     if not listed:
         return
     to_wdl = lambda wl, d: ((1 - d + wl) / 2, d, (1 - d - wl) / 2)
+    spec = y60_spec()
+    raw = dict(Y60_RAW) if spec is not None else {}   # this search's children, before the nested searches overwrite Y60_RAW
+    dbg_in, dbg_nest = {}, {}   # TOBY2_DUMP only: each blend's move-view input and the nested line
     upd = {}
     best = max(listed, key=lambda u: EV_LAST[u][0])   # the best move view (ES = (1 + W - L) / 2); first in probability order on a tie
+    nexts = []
     for u in listed[:3] + ([best] if best not in listed[:3] else []):
-        if stop_flag.is_set():
-            return
         c = b.copy()
         c.push(chess.Move.from_uci(u))
-        if c.is_game_over():
+        nexts.append((u, c, c.is_game_over()))
+    for k, (u, c, over) in enumerate(nexts):
+        if stop_flag.is_set():
+            return
+        if over:
             continue
+        if t2_on():   # pipelining: the next position's body pass during this one's Stockfish complements (output-identical)
+            later = [c2 for _, c2, o2 in nexts[k + 1:] if not o2]
+            if later:
+                try:
+                    t2_queue_body(later[0])
+                except Exception:  # noqa: BLE001
+                    pass
         r = evaluate_position(c)
         if stop_flag.is_set():
             return
         if r is None:   # no line there (search stopped or failed): the move keeps its move view
             continue
         wm, dm, lm = to_wdl(*EV_LAST[u])
+        if u in raw and raw[u][1] is not None:   # Y60-half: the deepened move's own view at v x deepened_scale (the shown one chose it)
+            wm, dm, lm = y60_correct(raw[u][0], raw[u][1], raw[u][2], raw[u][3], spec, scale=float(spec["deepened_scale"]))
+        dbg_in[u], dbg_nest[u] = [wm, dm, lm], list(r)
         lc, dc, wc = to_wdl(*r)   # the next position's line is for its side to move: flipped
         w_, d_, l_ = ((1 - DEEPEN_W) * wm + DEEPEN_W * wc, (1 - DEEPEN_W) * dm + DEEPEN_W * dc, (1 - DEEPEN_W) * lm + DEEPEN_W * lc)
         upd[u] = (w_ - l_, d_)
@@ -2277,20 +2742,1026 @@ def deepen(b, dist, t0):
     W = sum(dist[u] * to_wdl(*vals[u])[0] for u in listed) / tot
     D = sum(dist[u] * to_wdl(*vals[u])[1] for u in listed) / tot
     L_ = sum(dist[u] * to_wdl(*vals[u])[2] for u in listed) / tot
+    if os.environ.get("TOBY2_DUMP"):   # development / checks: the deepened block's exact numbers (offline recomputation of Deepening)
+        try:
+            with open(os.environ["TOBY2_DUMP"], "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"deepened": {"fen": b.fen(), "listed": listed, "p": {u: dist[u] for u in listed},
+                                                  "views": {u: list(EV_LAST[u]) for u in listed}, "chosen": [u for u, _, _ in nexts],
+                                                  "inputs": dbg_in, "nested": dbg_nest, "upd": {u: list(v) for u, v in upd.items()},
+                                                  "position": [W, D, L_], "w": DEEPEN_W}}) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            out(f"info string toby deepening dump failed ({exc})")
     emit(3, dist, {}, {}, None, 1, t0, False, evals=upd, root_eval=(W - L_, D), bd=b)
     out("info string toby deepened")
+
+
+
+# ----------------------------------------------------------------------------------------------------- Toby 2 move model (network B)
+# toby2.py: network B (Leela BT4 body fine-tuned on human games, move head + W/D/L head) with Stockfish 19 values by Toby 1.0's recipe
+# (V2_BASE nodes on every move, V2_EXT on the candidates). Option Move Network = Toby 2 (default when the weights file is found) replaces
+# Maia + the corrector for the move distribution; Toby 1.0's surrounding modules stay, each switchable: Rating Source conversion, the
+# per-move W/D/L (Move Evaluations: Toby 2 = network B on each position after a move, the default since 2.0.2 / Toby 1.0 = Toby 1.0's
+# module, with Endgame Evaluation / Off), the position's W/D/L (Position Evaluation: Toby 2 = sum over the moves of Toby 2's probability x
+# Toby 2's W/D/L after the move, the default since 2.0.2 / Network = B's W/D/L head / Toby 1.0 / Mix), Deepening, the Human-mode blunder
+# check. No silent fallback: a missing or failed network is said, and Toby 1.0 answers.
+MOVE_NETWORKS = ["Toby 2", "Toby 1.0"]
+T2_DEVICES = ["Auto", "CPU", "GPU"]
+MOVE_EVALS = ["Toby 2", "Toby 1.0", "Off"]   # option Move Evaluations ("true" = Toby 2, "false" = Off: the check option of 2.0 / 2.0.1)
+POSITION_EVALS = ["Toby 2", "Network", "Toby 1.0", "Mix"]
+# "Move Evaluations = Toby 1.0" with "Position Evaluation = Network" gives exactly the 2.0.1 answer (W/D/L included).
+T2 = {"net": None, "error": None, "loading": None, "search": None, "eng": None, "cfg": None, "lc0": None, "leela": None, "leela_error": None}
+T2_PRODUCTS = ["Standard", "Accurate"]   # one product file each (toby2_standard.json / toby2_accurate.json, next to the network files).
+# Standard = the sealed protocol's "Toby 2 Fast" (label only). Accurate is GPU-only: offered only with an NVIDIA GPU and a lc0 next to
+# Toby, and used only when the probe passes (otherwise Standard answers, said once and in the path line). Toby 1.0 keeps its own names.
+T2_HEADS = ["Product", "On", "Off"]  # Leela head (Accurate only): Product = the product file's rule per cadence (classical on; rapid / blitz
+                                     # by the sealed protocol's rule 6.3), On / Off = forced (scoring H-rb / A-FB)
+T2_GO_INC = [None]   # the mover's increment (s) of the last 'go winc / binc', used with the GUI's clocks
+T2_VALUES_BELOW = float(os.environ.get("TOBY2_VALUES_BELOW", "0.6"))   # seconds for the move: below, B alone with its value inputs masked
+# Base time / increment when the user sets none (options Base Time = 0, Increment = -1): unknown, the masked path. Measured on 3,000 classical
+# dev positions with the stand-in network (nn/v7/toby2_check.py clocks): clocks and base / increment masked +0.0072 [+0.0042; +0.0107] LL
+# against the true values; clocks masked with the true base +0.0015 (n.s.); clocks masked with 90 min + 30 s +0.0009 (n.s.). To re-check
+# with the final network. With 'go wtime btime' the GUI's clocks are used (increment from winc / binc).
+# The third Stockfish (output-identical speculative complements, toby2.Toby2Search spec3). TOBY2_SPEC3_MIN_CORES (development, the old
+# rule): from this many CPUs in the affinity mask, 0 = never. Otherwise automatic: on when usable_cores() minus t2_cores_used() leaves at
+# least T2_SPEC3_FREE cores. On the A40 pod (7.65-core quota, 3.65 or 2.65 free) it slowed the body more than it saved (0.594 vs 0.565-0.570 s):
+# off there.
+T2_SPEC3_MIN_CORES = int(os.environ["TOBY2_SPEC3_MIN_CORES"]) if os.environ.get("TOBY2_SPEC3_MIN_CORES") else None
+T2_SPEC3_FREE = float(os.environ.get("TOBY2_SPEC3_FREE", "16"))   # measured (the method page): no gain with 2.65-3.65 free (A40), 4 or 12 free (CPU pod)
+T2_SF_THREADS = int(os.environ.get("TOBY2_SF_THREADS", "1"))   # development speed study only: != 1 changes the values (lesson P2), said in the path line
+T2_MIX_W = 0.5   # Position Evaluation = Mix: W/D/L = (1 - w) network + w Toby 1.0 (test T1, nn/v7/TOBY1_TO_TOBY2.md section 4)
+try:
+    import toby2 as _T2MOD
+    if WThread is PooledThread:   # toby2.py's per-search threads (body, speculation, Leela) reuse workers too (its file is unchanged)
+        _T2MOD.threading = _ThreadingForToby2()
+    T2_WEIGHTS = _T2MOD.default_weights()
+except Exception as _exc:  # noqa: BLE001
+    _T2MOD, T2_WEIGHTS = None, None
+    T2["error"] = f"toby2 module: {_exc}"
+opts.update({"t2_product": {"Fast": "Standard"}.get(os.environ.get("TOBY2_PRODUCT", "Standard"), os.environ.get("TOBY2_PRODUCT", "Standard")),
+             "t2_head": "Product", "t2_candidates_set": False})
+opts.update({"move_network": "Toby 2" if (T2_WEIGHTS is not None and T2_WEIGHTS.exists()) else "Toby 1.0",
+             "t2_candidates": os.environ.get("TOBY2_CANDIDATES", "Maia C"), "t2_device": os.environ.get("TOBY2_DEVICE", "Auto"),
+             "t2_threads": int(os.environ.get("TOBY2_THREADS", "0")), "t2_move_evals": os.environ.get("TOBY2_MOVE_EVALS", "Toby 2"),
+             "t2_position_eval": os.environ.get("TOBY2_POSITION_EVAL", "Toby 2"),
+             "t2_blunder_check": True, "t2_base": 0, "t2_inc": -1})
+
+
+def t2_config_path():
+    """The product file: TOBY2_CONFIG (one file, the product is then fixed), else toby2_<product>.json next to the network file. None if absent
+    (development copies without product files: the network file alone, said in the path line)."""
+    env = os.environ.get("TOBY2_CONFIG")
+    if env:
+        return Path(env)
+    f = t2_config_dir() / f"toby2_{opts['t2_product'].lower()}.json"
+    return f if f.exists() else None
+
+
+def t2_config_dir():
+    return Path(os.environ.get("TOBY2_CONFIG_DIR") or (T2_WEIGHTS.parent if T2_WEIGHTS is not None else HERE))
+
+
+def t2_accurate_offered():
+    """The option Toby 2 Product lists Accurate only where it can run: its product file, an NVIDIA GPU answering nvidia-smi and a lc0
+    file (the light package has no lc0). The full probe (sm_86, hashes, one lc0 start) runs when Accurate is chosen."""
+    cfgf = Path(os.environ["TOBY2_CONFIG"]) if os.environ.get("TOBY2_CONFIG") else t2_config_dir() / "toby2_accurate.json"
+    try:
+        acc = cfgf.exists() and bool(json.loads(cfgf.read_text(encoding="utf-8")).get("head"))
+    except Exception:  # noqa: BLE001
+        acc = False
+    return acc and HAS_NVIDIA and bool(os.path.exists(LC0) or shutil.which(LC0))
+
+
+def t2_device():
+    d = opts["t2_device"]
+    cfg = T2.get("cfg")
+    if d == "Auto" and cfg is not None:   # the product file's device (Fast: the CPU; Accurate: the GPU)
+        d = {"cpu": "CPU", "cuda": "GPU"}.get(cfg.get("device"), "Auto")
+    if d == "CPU":
+        return "cpu"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:  # noqa: BLE001
+        pass
+    if d == "GPU":
+        out("info string Toby 2: no NVIDIA GPU answered, network on the processor")
+    return "cpu"
+
+
+T2_LOAD_LOCK = threading.RLock()   # one load of network B at a time (the background load at launch, isready, a search)
+
+
+def load_t2():
+    """Loads network B once (about 3-10 s) with the product file's settings; errors are kept and said at each search, never hidden."""
+    with T2_LOAD_LOCK:
+        if T2["net"] is not None and T2.get("loaded_for") not in (None, opts["t2_product"]) and not os.environ.get("TOBY2_CONFIG"):
+            T2.update(net=None, search=None, cfg=None, error=None)   # the product changed while the background load ran: the asked one
+        return _load_t2()
+
+
+def t2_prepare():
+    """isready: everything the first Toby 2 search would otherwise do first, so that it answers at once: network B loaded with the
+    current options, for Accurate the GPU / lc0 probe settled (or its wait run out: the next search does not wait again), the network
+    reloaded if the device changed, the Stockfish engines started. The same calls as at the start of _search_t2."""
+    if not t2_on() or os.environ.get("TOBY2_ISREADY_LOAD", "1") == "0":   # 0: the old behaviour (network B loaded at the first search)
+        return
+    net = load_t2()
+    if net is not None and T2.get("cfg") is not None and T2["cfg"].get("head"):
+        if t2_probe_settle() and T2.get("standard_after_probe"):
+            T2["standard_after_probe"] = False
+            net = load_t2()
+    if net is not None and net.device != t2_device():
+        T2.update(net=None, search=None)
+        net = load_t2()
+    if net is not None:   # Stockfish started from a daemon thread, as when a search starts it: python-chess's engine threads then do
+        th_ = threading.Thread(target=t2_searcher, daemon=True)   # not keep the process alive after 'quit'
+        th_.start()
+        th_.join()
+
+
+def t2_say_missing():
+    """Once: Toby 2 is the default but its network file (or module) is missing, so Toby 1.0 answers (said, never silent)."""
+    if T2.get("said_missing") or t2_on() or (opts.get("move_network_set") and opts["move_network"] != "Toby 2"):
+        return   # (a user who chose Toby 1.0 is not told)
+    T2["said_missing"] = True
+    if _T2MOD is None:
+        out(f"info string Toby 2 unavailable ({T2['error']}): {T1_ANSWERS}")
+    else:
+        out(f"info string Toby 2 network not found ({T2_WEIGHTS}): {T1_ANSWERS}")
+
+
+def _load_t2():
+    if T2["net"] is not None or T2["error"] or _T2MOD is None:
+        return T2["net"]
+    prod0 = opts["t2_product"]
+    try:
+        t = time.time()
+        cp = t2_config_path()
+        if cp is None and opts["t2_product"] == "Accurate" and not os.environ.get("TOBY2_CONFIG"):   # e.g. the light package: no
+            sp_ = t2_config_dir() / "toby2_standard.json"                                         # Accurate product file, no lc0
+            if sp_.exists():
+                why = "no lc0 in this package" if not (os.path.exists(LC0) or shutil.which(LC0)) else "no toby2_accurate.json in this package"
+                T2["accurate_unavailable"] = T2["accurate_unavailable"] if T2.get("accurate_unavailable") else why
+                if not T2.get("said_unavailable"):
+                    T2["said_unavailable"] = True
+                    out(f"info string Toby 2 Accurate is not available here ({why}): Toby 2 Standard answers")
+                cp = sp_
+        if cp is not None and T2.get("accurate_unavailable"):   # Accurate already found unusable in this process: Standard, for good
+            cp = Path(cp).parent / "toby2_standard.json"
+        cfg = T2["cfg"] = _T2MOD.load_config(cp) if cp is not None else None   # raises on a hash mismatch: Toby 2 is then unavailable (said)
+        y60_check(cfg)   # a malformed wdl_correction field: Toby 2 unavailable, said (never a silent guess)
+        if cfg is not None and cfg.get("head") and cfg.get("leela") and T2["leela"] is None and not T2["leela_error"]:   # Accurate is GPU-only: the probe (GPU <= 5 s, lc0 start <= 10 s,
+            # self-check ~1-3 s) runs in the background while network B loads; a quick failure (no GPU visible, nvidia-smi) is known at once
+            th_ = T2["probe"] = threading.Thread(target=t2_leela, daemon=True)
+            th_.start()
+            th_.join(timeout=1.0)
+            if not th_.is_alive() and T2["leela"] is None:
+                cfg = t2_to_standard(cp)
+        weights, head = T2_WEIGHTS, None
+        if cfg is not None:
+            weights = Path(cfg["network"]["path"])
+            head = cfg["head"]["path"] if cfg.get("head") else None
+            if not opts["t2_candidates_set"]:
+                opts["t2_candidates"] = cfg["candidates"]
+        dev = t2_device()
+        dtype = (cfg or {}).get("compute", {}).get(dev, {}).get("dtype") or ("fp16" if dev == "cuda" and os.environ.get("TOBY2_FP16") == "1" else "fp32")
+        th = opts["t2_threads"] or (2 if n_cores() >= 4 else 1)   # 4 threads in all: 2 for B, one per Stockfish (base, extension)
+        T2["net"] = _T2MOD.Toby2Net(weights, device=dev, dtype=dtype, threads=th, head=head)
+        T2["loaded_for"] = prod0   # also on the GPU: torch's default (one thread per visible core) oversubscribes the CPU quota
+        STARTUP["toby2"] = time.time()
+        out(f"info string toby timing toby2 network loaded {time.time() - t:.2f}s ({T2['net'].label})")
+    except Exception as exc:  # noqa: BLE001
+        T2["error"] = f"{type(exc).__name__}: {exc}"
+    return T2["net"]
+
+
+def t2_on():
+    return opts["move_network"] == "Toby 2" and _T2MOD is not None and T2_WEIGHTS is not None and T2_WEIGHTS.exists()
+
+
+def t2_head_wanted():
+    """The Leela head for this search: Accurate product only; classical by the product file (on), rapid / blitz by its rule (6.3 of the
+    sealed protocol: off = B-rb, on = H-rb); option Leela Head = On / Off forces it."""
+    cfg, net = T2.get("cfg"), T2.get("net")
+    if cfg is None or not cfg.get("head") or net is None or net.head is None:
+        return False
+    if opts["t2_head"] != "Product":
+        return opts["t2_head"] == "On"
+    rule = cfg["head_rule"]["classical" if opts["mode"] == "Classical" else "rapid_blitz"]
+    return rule == "on"
+
+
+T2_LC0_START_S = float(os.environ.get("TOBY2_LC0_START_TIMEOUT", "10"))    # lc0 start + network load, at most (then: said, head off)
+T2_LC0_SEARCH_S = float(os.environ.get("TOBY2_LC0_SEARCH_TIMEOUT", "20"))  # one 1,024-node search, at most (~0.3 s on an A40)
+T2_LEELA_LOCK = threading.Lock()
+
+
+def t2_leela():
+    """The Accurate product's Leela input path (LeelaInputs on its own lc0 process): probed and started ONCE per process (GPU probe <= 5 s,
+    lc0 start <= TOBY2_LC0_START_TIMEOUT s, started in the background when the Accurate network loads); the decision is cached. None with
+    the reason kept in T2['leela_error'] when lc0 cannot be used here (no GPU visible, nvidia-smi failing, card not Ampere sm_86, lc0 /
+    BT3 missing or not the product file's, lc0 hanging or exiting at start, or a failed search later: lc0 is then stopped and never
+    relaunched): said at every search and recorded in the path line, the answer is then B's with Stockfish values (never silent)."""
+    with T2_LEELA_LOCK:
+        if T2["leela"] is not None or T2["leela_error"]:
+            return T2["leela"]
+        lz = T2["cfg"]["leela"]
+        t0 = time.time()
+        try:
+            ok, gpu = _T2MOD.gpu_for_lc0()
+            if not ok:
+                raise RuntimeError(gpu)
+            exe = shutil.which(LC0) or LC0
+            if not os.path.exists(exe):
+                raise _T2Unavailable("no lc0 in this package")
+            if not os.path.exists(NET):
+                raise RuntimeError(f"lc0 or its network not found ({exe}, {NET})")
+            if os.environ.get("TOBY2_LC0_NO_HASH") != "1":   # development tests of the start failures only (fake lc0); said below
+                plat = "windows" if os.name == "nt" else ("macos" if sys.platform == "darwin" else "linux")
+                want_lc0 = lz.get("lc0_sha256")
+                want_lc0 = want_lc0.get(plat) if isinstance(want_lc0, dict) else want_lc0   # per platform; None = not pinned there (self-check only)
+                for what, f, want in (("lc0", exe, want_lc0), ("Leela network", NET, lz.get("network_sha256"))):
+                    if want and _T2MOD.sha256(f) != want:
+                        raise RuntimeError(f"{what} {Path(f).name} is not the product file's ({want[:16]})")
+            else:
+                out("info string Toby 2 Accurate: lc0 / BT3 hash check skipped (TOBY2_LC0_NO_HASH=1, development only)")
+            try:
+                T2["lc0"] = Lc0(backend=lz["backend"], start_timeout=T2_LC0_START_S, search_timeout=T2_LC0_SEARCH_S)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"lc0 did not start within {T2_LC0_START_S:.0f} s or exited ({exc})") from None
+            li = _T2MOD.LeelaInputs(T2["lc0"], lz["backend"], int(lz["nodes"]))
+            if lz.get("selfcheck"):   # the card is accepted on evidence: 3 fixed positions against the stored A40 features
+                # The probe runs in the background (from isready / the first Accurate search), when the UCI stop flag may be set: 'ucinewgame'
+                # sets it until the next 'go'. Its searches therefore obey their own event, never set: a 'stop' or 'ucinewgame' meant for a search
+                # must not cut the self-check short (it would see no visits and refuse a good card). The watchdog still bounds each search.
+                T2["lc0"].stop_event = threading.Event()
+                try:
+                    ok, chk = _T2MOD.lc0_selfcheck(li, lz["selfcheck"])
+                finally:
+                    T2["lc0"].stop_event = None
+                if not ok:
+                    raise RuntimeError(f"{gpu}: {chk}")
+                gpu = f"{gpu}; {chk}"
+            if T2.get("accurate_unavailable"):   # the probe finished after its wait ran out: Standard already answers, lc0 is not kept
+                raise RuntimeError(T2["accurate_unavailable"])
+            T2["leela"] = li
+            T2["leela"].gpu = gpu
+            T2["leela_gpu"] = gpu
+            out(f"info string toby timing toby2 lc0 started {time.time() - t0:.2f}s ({lz['backend']}, {gpu})")
+        except Exception as exc:  # noqa: BLE001
+            if not T2["leela_error"]:
+                T2["leela_error"] = str(exc) if isinstance(exc, _T2Unavailable) else f"{type(exc).__name__}: {exc}"
+            t2_leela_stop()
+        return T2["leela"]
+
+
+class _T2Unavailable(RuntimeError):
+    """A reason Accurate cannot run here, said as it is (no exception name)."""
+
+
+def t2_to_standard(cp):
+    """Accurate is not available on this machine: Toby 2 Standard's product file (next to Accurate's), said once, in every path line."""
+    T2["accurate_unavailable"] = T2["leela_error"]
+    sp = Path(cp).parent / "toby2_standard.json"
+    if not T2.get("said_unavailable"):
+        T2["said_unavailable"] = True
+        out(f"info string Toby 2 Accurate is not available here ({T2['leela_error']}): Toby 2 Standard answers")
+    if not sp.exists():
+        raise RuntimeError(f"Accurate unavailable and no {sp.name} next to it")
+    cfg = T2["cfg"] = _T2MOD.load_config(sp)
+    return cfg
+
+
+T2_PROBE_WAIT_S = float(os.environ.get("TOBY2_PROBE_WAIT", "12"))   # a first Accurate search waits at most this for the probe
+
+
+def t2_probe_settle():
+    """Called by each search of the Accurate product: waits (at most T2_PROBE_WAIT_S) for the background probe; if it failed, Toby 2
+    Standard takes over for the session (network reloaded with Standard's product file, said once). Returns False while it still runs
+    (that answer: head off, said)."""
+    th_ = T2.get("probe")
+    if th_ is not None and th_.is_alive():
+        if T2.get("probe_waited"):   # the probe already had its wait once: no second wait; Toby 2 Standard answers for the session
+            if not T2["leela_error"]:
+                T2["leela_error"] = f"the GPU / lc0 probe did not finish within {T2_PROBE_WAIT_S:.0f} s"
+        else:
+            th_.join(timeout=T2_PROBE_WAIT_S)
+            if th_.is_alive():
+                T2["probe_waited"] = True
+                return False
+    if T2["leela"] is None and T2.get("cfg") is not None and T2["cfg"].get("head") and not T2.get("accurate_unavailable"):
+        cp = Path(os.environ["TOBY2_CONFIG"]) if os.environ.get("TOBY2_CONFIG") else t2_config_dir() / "toby2_accurate.json"
+        T2.update(net=None, search=None)
+        T2["error"] = None
+        t2_to_standard(cp)
+        T2["standard_after_probe"] = True
+    return True
+
+
+def t2_leela_stop():
+    """lc0 of Toby 2 stopped for good (a failed start or search): never relaunched in this process."""
+    lc = T2.get("lc0")
+    T2["lc0"] = T2["leela"] = None
+    if lc is not None:
+        try:
+            lc.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def t2_leela_failed(reason):
+    with T2_LEELA_LOCK:
+        if not T2["leela_error"]:
+            T2["leela_error"] = f"search failed earlier in this session ({reason}); lc0 stopped, not relaunched"
+        t2_leela_stop()
+
+
+def t2_maia_top3(b):
+    E, Eo = _T2MOD._E_box
+    _FT.force = True
+    try:
+        pm = maia_policy(b, rule_params(E)[0], rule_params(Eo)[0], history=False)   # as the training values (toby_values2: position alone)
+    finally:
+        _FT.force = None
+    return maia_top3(pm, b)
+
+
+def t2_spec3_wanted():
+    """Whether this process runs the third Stockfish: TOBY2_SPEC3_MIN_CORES if set (old rule), else enough free cores (T2_SPEC3_FREE)."""
+    if T2_SPEC3_MIN_CORES is not None:
+        return T2_SPEC3_MIN_CORES > 0 and n_cores() >= T2_SPEC3_MIN_CORES
+    return T2_SF_THREADS == 1 and usable_cores() - t2_cores_used() >= T2_SPEC3_FREE
+
+
+def t2_searcher():
+    if T2["search"] is None:
+        if T2["eng"] is None and os.path.exists(SF_PATH):
+            T2["eng"] = StockfishCalc(fixed_threads=T2_SF_THREADS)   # 1 thread, Hash 64 MB cleared before every search: the training values' settings
+        if T2.get("spec3") is None and t2_spec3_wanted() and os.path.exists(SF_PATH):
+            try:   # a third single-thread Stockfish: speculative complements on B's top 3 + pass 1's provisional top 2 (output-identical)
+                T2["spec3"] = StockfishCalc(fixed_threads=1)
+            except Exception:  # noqa: BLE001
+                T2["spec3"] = None
+        T2["search"] = _T2MOD.Toby2Search(T2["net"], T2["eng"], spec_engine(), V2_BASE, V2_EXT, maia_top3=t2_maia_top3, spec_lock=_SPEC["busy"],
+                                          cand_pass=(T2.get("cfg") or {}).get("candidate_pass", "masked"), spec3=T2.get("spec3"))
+    return T2["search"]
+
+
+def t2_side(net, child=False):
+    """B's side inputs of the current search: base / increment from the options (else the GUI's increment with its clocks), the clocks of
+    'go wtime btime' (analysis: unknown, the masked-clock path, as the training rows seen without clocks), cadence and venue.
+    child=True: those of the positions after a move (Toby 2's per-move W/D/L): the same, with the two clocks as at the root seen from
+    the side to move there (the root's opponent)."""
+    if CLOCK is not None:
+        clk, clko = CLOCK
+    else:
+        clk = clko = None
+    if child:
+        clk, clko = clko, clk
+    base = float(opts["t2_base"]) if opts["t2_base"] else None
+    inc = float(opts["t2_inc"]) if opts["t2_inc"] >= 0 else (T2_GO_INC[0] if CLOCK is not None else None)
+    return net.side_inputs(base, inc, clk, clko, _T2MOD.TIME_CONTROL_CADENCE[opts["mode"]], venue())
+
+
+def t2_queue_body(c):
+    """Deepening: the body pass of the next position c (searched right after the current one) is made during the current search's wait
+    for its complements (toby2.Toby2Search.prefetch_body, output-identical: used only if that search's inputs are exactly these). Only on
+    the GPU, or on the processor with free cores for it."""
+    S, net = T2.get("search"), T2.get("net")
+    if not T2_BODY_PREFETCH or S is None or net is None or S.net is not net:
+        return
+    if not (str(net.device).startswith("cuda") or usable_cores() - t2_cores_used() - (1 if T2.get("spec3") is not None else 0) >= T2_PREFETCH_CPU_FREE):
+        return
+    E, opp = side_ratings(c)
+    src = opts["t2_candidates"]
+    if src == "Maia C" and maia_ft is None:
+        src = "Network"
+    S.next_body = (c, E, opp[0] if opp else E, t2_side(net), src)
+
+
+T2_BODY_PREFETCH = os.environ.get("TOBY2_BODY_PREFETCH", "1") != "0"   # Deepening's body pipelining (output-identical; 0 = off, for checks)
+
+
+def _sf_pseudo_leela(sf):
+    """nn/corrector.sf_pseudo_leela(sf) (Stockfish values as Leela-like (N, WL, D, Q) per move, root = the best move's), from the module
+    when it is there, else this copy of the same code (a package without nn/corrector.py must still answer)."""
+    if _NNC is not None:
+        return _NNC.sf_pseudo_leela(sf)
+    lee = {}
+    for u, cp in sf.items():
+        q = max(-0.999, min(0.999, math.atan(cp / 111.714640912) / 1.5620688421))
+        lee[u] = (100, q, 0.0, q)
+    if not lee:
+        return lee, None
+    best = max(lee, key=lambda u: lee[u][3])
+    return lee, (lee[best][3], lee[best][2])
+
+
+T2_NN_FILES = ["wdl_sf_constants.json", "sf_to_leela.json", "wdl_ext_params_v4.json", "wdl_endgame_p1.py", "wdl_mix_q_classical.json",
+               "deepening_params.json"]   # nn/ files Toby 2's Toby 1.0 modules read (Move Evaluations, Endgame Evaluation M, Deepening)
+
+
+def t2_say_nn_missing():
+    """Once: nn/ files the Toby 2 answer reads are missing (a damaged or partial package): said, the answer still comes (their fallbacks)."""
+    if T2.get("said_nn"):
+        return
+    T2["said_nn"] = True
+    def present(f):   # a module counts when it can be imported (frozen into toby.exe: no .py in nn/); data files must be there
+        if not f.endswith(".py"):
+            return (HERE / "nn" / f).exists()
+        try:
+            import importlib.util
+            if str(HERE / "nn") not in sys.path:
+                sys.path.append(str(HERE / "nn"))
+            return importlib.util.find_spec(f[:-3]) is not None
+        except Exception:  # noqa: BLE001
+            return False
+    miss = [f for f in T2_NN_FILES if not present(f)]
+    if _NNC is None:
+        miss.append("corrector.py / corrector_weights.json")
+    if miss:
+        out("info string Toby 2: files missing in nn/: " + ", ".join(miss) + " (Move Evaluations and the position's W/D/L use fallbacks; "
+            "reinstall Toby)")
+
+
+def _search_t2(b, E, opp, t0, emit_, movetime):
+    """One Toby 2 search: returns the distribution, or None (Toby 1.0 answers: said, never silent)."""
+    net = load_t2()
+    if net is not None and T2.get("cfg") is not None and T2["cfg"].get("head"):   # Accurate: the background probe's verdict
+        if not t2_probe_settle():
+            T2["probe_pending_said"] = True
+        elif T2.get("standard_after_probe"):
+            T2["standard_after_probe"] = False
+            net = load_t2()
+    if net is not None and net.device != t2_device():   # Network Device changed while the background load ran: reload on the asked device
+        T2.update(net=None, search=None)
+        net = load_t2()
+    if net is None:
+        out(f"info string Toby 2 unavailable ({T2['error']}): {T1_ANSWERS}")
+        return None
+    Eo = opp[0] if opp else E
+    mode = opts["mode"]
+    side = t2_side(net)
+    values = movetime is None or movetime >= T2_VALUES_BELOW
+    src = opts["t2_candidates"]
+    if src == "Maia C":
+        wait_maia(ft=True)
+        if maia_ft is None:
+            out("info string Toby 2: the fine-tuned Maia is not loaded, candidates from the network")
+            src = "Network"
+    S = t2_searcher()
+    if S.eng is None:
+        out("info string Toby 2: Stockfish not found, network alone (value inputs masked)")
+        values = False
+    _T2MOD._E_box = (E, Eo)
+    want_head = t2_head_wanted()
+    pending = T2.get("probe") is not None and T2["probe"].is_alive()
+    leela = None if pending else (t2_leela() if want_head else None)
+    why = "the GPU / lc0 probe is still running" if pending else T2["leela_error"]
+    if want_head and leela is None:
+        out(f"info string Toby 2 Accurate: Leela unavailable ({why}): network B with Stockfish values answers (head off)")
+    want_t1, want_t2 = t2_eval_wants(movetime)
+    if want_t1:   # a Toby 1.0 module (Move Evaluations = Toby 1.0, Position Evaluation = Toby 1.0 / Mix): Maia is loaded now if needed
+        wait_maia(timeout=T2_MAIA_WAIT)
+    pre = None
+    if values and S.eng is not None and maia is not None and T2_EVAL_PREFETCH and t2_prefetch_ok() and want_t1:
+        pre = EvalPrefetch()
+    _EVPRE[0] = pre
+    kids = None
+    if want_t2:   # Toby 2's per-move W/D/L: network B on the positions after the moves (batch during the Stockfish complements)
+        kids = T2Children(S, b, E, Eo, t2_side(net, child=True), boost=t2_child_threads(net) if pre is None else None)
+    if T2_PROVISIONAL and values and S.eng is not None and opts.get("provisional", True) and not getattr(_MUTE, "on", False) \
+            and CLOCK is None and not stop_flag.is_set():   # 2.2.1: network B alone at once (stage 1, final 0), then the full answer
+        # as before; never for a clocked game move (go wtime / btime: Siby reads only bestmove there, and it would spend the clock)
+        t2_provisional(S, b, E, Eo, net, t0, emit_)
+    try:
+        return _search_t2_answer(S, b, E, Eo, opp, side, src, values, leela, want_head, why, t0, emit_, movetime, mode, pre, kids)
+    finally:
+        _EVPRE[0] = None
+
+
+T2_PROVISIONAL = not TOBY1_SHIPPED and os.environ.get("TOBY2_PROVISIONAL", "1") != "0"   # 2.2.1 (no Toby 1.0): the provisional block
+
+# ---------------------------------------------------------------------------------------------- W/D/L correction (product field)
+# DRAFT (nn/PROTOCOL_TOBY2_PASS3_DRAFT.md 14, 14.2, 14.3; the reference implementation is nn/sealed_t2_pass3/wdl_y.py, which the offline
+# checks import): the product file's "wdl_correction": {"classical": RULE}. Each child W/D/L (the root mover's view) is blended with a
+# Stockfish W/D/L built from that move's root value (form "sf_blend_gap", the rule: with the two ratings; "sf_blend", the earlier Y60:
+# without); a cadence group that is not in the field = no correction (rapid / blitz). Absent field: the engine is 2.2.1 without it.
+Y60_FORMS = ("sf_blend_gap", "sf_blend")
+Y60_RAW = {}   # this search's children: {uci: (raw (W, D, L), root value or None, E_child, E_opp)} for deepen (the deepened moves' half-scale view)
+
+
+def y60_check(cfg):
+    """Raises on a malformed wdl_correction field (wdl_y.check_rule: any other form or key set is refused, never a silent guess)."""
+    f = (cfg or {}).get("wdl_correction")
+    if f is None:
+        return
+    if not isinstance(f, dict) or not set(f) <= {"classical", "rapid_blitz"}:
+        raise ValueError(f"wdl_correction: unknown groups {sorted(f) if isinstance(f, dict) else f}")
+    for g, rule in f.items():
+        if not isinstance(rule, dict) or rule.get("form") not in Y60_FORMS:
+            raise ValueError(f"wdl_correction.{g}: unknown form {rule.get('form') if isinstance(rule, dict) else rule!r}")
+        need = {"form", "g0", "tau", "deepened_scale"} | ({"a", "b", "c"} if rule["form"] == "sf_blend_gap" else set())
+        if set(rule) != need:
+            raise ValueError(f"wdl_correction.{g}: keys {sorted(rule)} != {sorted(need)}")
+
+
+def y60_spec():
+    """The wdl_correction rule of the current cadence (dict), or None (no correction)."""
+    f = (T2.get("cfg") or {}).get("wdl_correction")
+    if not f or _T2MOD is None:
+        return None
+    return f.get(_T2MOD.PENALTY_GROUP.get(_T2MOD.TIME_CONTROL_CADENCE[opts["mode"]], ""))
+
+
+def y60_share(v_m, E_child, E_opp, rule):
+    """wdl_y.sf_share: the ROOT mover's share s (0-1) from move m's root value v_m (root mover's view)."""
+    e = _T2MOD.expected_score(E_child, -v_m) / 100.0
+    if rule["form"] == "sf_blend":
+        return 1.0 - e
+    e = min(max(e, 1e-6), 1.0 - 1e-6)
+    z = float(rule["a"]) * math.log(e / (1.0 - e)) + float(rule["b"]) * (E_child - E_opp) / 400.0 + float(rule["c"])
+    return 1.0 - 1.0 / (1.0 + math.exp(-z))
+
+
+def y60_correct(c, v_m, E_child, E_opp, rule, scale=1.0):
+    """wdl_y.correct: c = (W, D, L) of the root mover, v_m = the move's root Stockfish value (cp, mover's view), E_child = the child mover's
+    Elo (the root's Eo), E_opp = the root mover's Elo (E); scale = 1, or rule["deepened_scale"] for a deepened move's view."""
+    W, D, L = (float(x) for x in c)
+    s = y60_share(v_m, E_child, E_opp, rule)
+    d = min(D, 2.0 * min(s, 1.0 - s))
+    S = (s - d / 2.0, d, 1.0 - s - d / 2.0)
+    gap = abs(100.0 * (W + D / 2.0) - 100.0 * (S[0] + S[1] / 2.0))
+    z = (gap - float(rule["g0"])) / float(rule["tau"])
+    v = scale * (1.0 / (1.0 + math.exp(-z)) if z > -700 else 0.0)
+    lg = [(1.0 - v) * math.log(max(a, 1e-9)) + v * math.log(max(b, 1e-9)) for a, b in zip((W, D, L), S)]
+    m = max(lg)
+    e = [math.exp(x - m) for x in lg]
+    t = sum(e)
+    return [x / t for x in e]
+
+
+def t2_provisional(S, b, E, Eo, net, t0, emit_):
+    """2.2.1 (Yosha): with Provisional Lines = true, every Toby 2 search shows network B alone (value inputs masked: the path of a move under
+    TOBY2_VALUES_BELOW) at once as a provisional block (stage 1, final 0: Siby greys it out and replaces it), then the full answer comes
+    as before (stage 3, final 1). The display state the final block reads (ROOT_LAST, LISTED, PRIOR) is restored after this block, so
+    the final block is exactly the one 2.2 prints. Kept in T2["prov"]: the move played if a stop comes before the full answer."""
+    saved = (list(ROOT_LAST), set(LISTED), dict(PRIOR))
+    try:
+        r = S.run(b, E, Eo, t2_side(net), source="Network", values=False)
+        dist = {u: float(math.exp(lp)) for u, lp in zip(r["legal"], r["logp"])}
+        l_, d_, w_ = (float(x) for x in r["wdl"])
+        PRIOR.clear()
+        PRIOR.update(dist)
+        emit_(1, dist, {}, {}, None, 1, t0, True, None, (w_ - l_, d_))
+        T2["prov"] = (b.fen(), dist)
+    except Exception as exc:  # noqa: BLE001   (display only: the full answer still comes)
+        out(f"info string Toby 2: provisional answer unavailable ({type(exc).__name__}: {exc})")
+    finally:
+        ROOT_LAST[:] = saved[0]
+        LISTED.clear(); LISTED.update(saved[1])
+        PRIOR.clear(); PRIOR.update(saved[2])
+
+
+def t2_eval_wants(movetime):
+    """(want_t1, want_t2) of a Toby 2 search: whether Toby 1.0's evaluation module runs (Move Evaluations = Toby 1.0 in analysis, or
+    Position Evaluation = Toby 1.0 / Mix), and whether Toby 2's child W/D/L run (Move Evaluations = Toby 2 in analysis, or Position
+    Evaluation = Toby 2: the position's W/D/L is then the sum over the moves of p x their W/D/L, in play too)."""
+    analysis = movetime is None
+    mv, pv = opts["t2_move_evals"], opts["t2_position_eval"]
+    return (mv == "Toby 1.0" and analysis) or pv in ("Toby 1.0", "Mix"), (mv == "Toby 2" and analysis) or pv == "Toby 2"
+
+
+T2_CHILD_PREFETCH = os.environ.get("TOBY2_CHILD_PREFETCH", "1") != "0"   # child batch during the complements (0 = after the search)
+T2_CHILD_THREADS = int(os.environ.get("TOBY2_CHILD_THREADS", "0"))   # torch threads of the child batch on the processor (0 = automatic)
+
+
+def t2_child_threads(net):
+    """Torch threads for the child W/D/L batch when network B runs on the processor, or None (= the network's own count). During the
+    Stockfish complements only Stockfish's two single-thread engines are busy: the batch may use the other usable cores (at most 8).
+    The final heads pass of the distribution waits for the batch (Toby2Search.run before_heads) and runs with the network's own count:
+    the distribution is the same as without the batch. Off when another torch job may run at the same time (Deepening's body pipelining,
+    Toby 1.0's Maia prefetch)."""
+    if str(net.device).startswith("cuda"):
+        return None
+    th = opts["t2_threads"] or (2 if n_cores() >= 4 else 1)
+    k = T2_CHILD_THREADS or int(max(th, min(8, usable_cores() - 2)))
+    return k if k > th else None
+
+
+class T2Children:
+    """Toby 2's per-move W/D/L for one search (Move Evaluations = Toby 2 / Position Evaluation = Toby 2, 2.0.2). For a human player the
+    position's value is V(position) = sum over the moves m of p(m) x V(after m), with p = Toby 2's move probabilities and V(after m) =
+    network B's W/D/L of the position after m (toby2.Toby2Net.child_wdl: B's body + W/D/L head, value inputs masked, the child's
+    ratings / clocks / history), flipped to the mover's view.
+    Moves evaluated (toby2.child_set): the most probable until 99 % of the probability is covered, at least 3, plus the most probable
+    move and Stockfish's best move. The probability left over (< 1 %) is spread over the evaluated moves in proportion to their
+    probability: V = sum_evaluated p V / sum_evaluated p (the covered mass is printed).
+    Timing (as the 2.0.1 Maia prefetch): once Stockfish pass 1 is done (Toby2Search.run on_base), a thread takes B's heads on the pass-1
+    values (provisional distribution), chooses its moves by the same rule and runs their batch while the 250k complements run; after
+    the search, the final distribution's moves not in that batch get a second batch. The answer's distribution is never changed."""
+
+    def __init__(self, S, b, E, Eo, side_c, boost=None):
+        self.S, self.b = S, b.copy()
+        self.E, self.Eo, self.side_c = E, Eo, side_c   # E / Eo: the ROOT mover's / opponent's strengths (the child swaps them)
+        self.boost = boost if T2_CHILD_PREFETCH else None
+        self.base_th = opts["t2_threads"] or (2 if n_cores() >= 4 else 1)
+        self.got, self.term, self.th, self.err = {}, {}, None, None
+        self.stats = {"prefetched": 0, "missing": 0, "t_prefetch": 0.0, "t_missing": 0.0}
+        for m in self.b.legal_moves:
+            c = self.b.copy(stack=False)
+            c.push(m)
+            if c.is_checkmate():
+                self.term[m.uci()] = (1.0, 0.0, 0.0)   # (child's loss, draw, win): mated there, the mover wins
+            elif c.is_game_over():
+                self.term[m.uci()] = (0.0, 1.0, 0.0)
+
+    def _compute(self, moves, boost):
+        todo = [u for u in moves if u not in self.got and u not in self.term]
+        if not todo:
+            return 0
+        torch = self.S.net.torch
+        if boost:
+            torch.set_num_threads(int(boost))
+        try:
+            self.got.update(self.S.net.child_wdl(self.b, todo, self.Eo, self.E, self.side_c))
+        finally:
+            if boost:
+                torch.set_num_threads(int(self.base_th))
+        return len(todo)
+
+    def on_base(self, enc, bout, base, lf_get):
+        """Toby2Search.run, pass 1 done (main thread, must not block): the prefetch thread."""
+        if not T2_CHILD_PREFETCH:
+            return
+        boost = self.boost if self.S._prebody is None else None   # Deepening's next body pass is running: no thread change
+
+        def _run():
+            try:
+                t = time.time()
+                f, s = self.S.net.features(enc, base, self.E)
+                lp, _ = self.S.net.heads(enc, bout, f, s)
+                prov = _T2MOD.child_set(enc["legal"], lp, extra=[max(base, key=base.get)])
+                self.stats["prefetched"] = self._compute(prov, boost)
+                self.stats["t_prefetch"] = time.time() - t
+            except Exception as exc:  # noqa: BLE001   (the moves are then computed after the search)
+                self.err = f"{type(exc).__name__}: {exc}"
+        self.th = WThread(target=_run, daemon=True)
+        self.th.start()
+
+    def wait(self):
+        """Toby2Search.run before_heads: the prefetch batch ends before the final heads pass."""
+        if self.th is not None:
+            self.th.join(T2_EVAL_TIMEOUT)   # bounded: a blocked batch must not hold the search (finish then says so)
+
+    def finish(self, legal, logp, values):
+        """-> ({uci: (W - L, D) for the mover}, (W - L, D) of the position = sum p V / covered, info) for the final distribution."""
+        self.wait()
+        if self.th is not None and self.th.is_alive():
+            raise RuntimeError(f"the child batch did not finish within {T2_EVAL_TIMEOUT:.0f} s")
+        dist = {u: math.exp(float(v)) for u, v in zip(legal, logp)}
+        extra = [max(legal, key=dist.get)] + ([max(values, key=values.get)] if values else [])
+        moves = _T2MOD.child_set(legal, logp, extra=extra)
+        t = time.time()
+        self.stats["missing"] = self._compute(moves, self.boost)
+        self.stats["t_missing"] = time.time() - t
+        evals, tot, acc = {}, 0.0, [0.0, 0.0, 0.0]
+        spec = y60_spec()
+        y60 = {}
+        Y60_RAW.clear()
+        for u in moves:
+            lc, dc, wc = self.term.get(u) or self.got[u]
+            W, D, L = lc, dc, wc   # the child's side to move is the opponent: flipped to the mover's view
+            if spec is not None:   # Y60: corrected before anything reads it (move views, EV_LAST, the position line)
+                v_m = values.get(u) if values else None
+                Y60_RAW[u] = ((W, D, L), v_m, self.Eo, self.E)
+                if v_m is not None:   # a child without a value keeps its raw W/D/L (it is still counted)
+                    W, D, L = y60_correct((W, D, L), v_m, self.Eo, self.E, spec)
+                y60[u] = [float(W), float(D), float(L)]
+            evals[u] = (W - L, D)
+            p = dist[u]
+            tot += p
+            acc[0] += p * W
+            acc[1] += p * D
+            acc[2] += p * L
+        W, D, L = (a / tot for a in acc) if tot > 0 else (0.0, 1.0, 0.0)
+        info = dict(self.stats, evaluated=len(moves), covered=tot, moves=moves, err=self.err,
+                    wdl={u: [float(x) for x in (self.term.get(u) or self.got[u])] for u in moves})   # the mover's (W, D, L), raw
+        if spec is not None:
+            info["wdl_y60"] = y60   # the corrected ones (dumps: offline checks recompute them from the raw)
+        return evals, (W - L, D), (W, D, L), info
+
+
+T2_EVAL_PREFETCH = os.environ.get("TOBY2_EVAL_PREFETCH", "1") != "0"   # Move Evaluations prefetch (output-identical; 0 = off, for checks)
+
+
+def t2_prefetch_ok():
+    """The prefetch runs Maia while the Stockfish complements run: on the GPU it costs no core; on the processor only when a core is free
+    for it besides those the search already uses (usable_cores, t2_cores_used)."""
+    if maia is not None and str(getattr(maia[0].cfg, "device", "cpu")).startswith("cuda"):
+        return True
+    return usable_cores() - t2_cores_used() - (1 if T2.get("spec3") is not None else 0) >= T2_PREFETCH_CPU_FREE
+
+
+T2_PREFETCH_CPU_FREE = float(os.environ.get("TOBY2_PREFETCH_CPU_FREE", "1000"))   # free cores needed when Maia runs on the processor: off by default
+# (CPU pod: median -0.10 to -0.23 s but p95 +0.4 s, a missed prefetch holds Maia for ~0.35 s; TOBY2_PREFETCH_CPU_FREE=2 turns it on)
+
+
+def _evals_prefetch_fn(S, b, E, x, opp, legal_box):
+    """The work of an EvalPrefetch (thread), from the pass-1 values: see EvalPrefetch."""
+    oppx = (opp[0], opp[1]) if opp else None
+
+    def fn(pre):
+        enc, bout, base, lf_get = legal_box
+        lf = lf_get()
+        f, s = S.net.features(enc, base, E)
+        lp, _ = S.net.heads(enc, bout, f, s, lf)
+        dist = {u: float(math.exp(v)) for u, v in zip(enc["legal"], lp)}
+        shown = [u for u, p in sorted(dist.items(), key=lambda kv: -kv[1]) if p >= 0.001][:SF_EVAL_MOVES]
+        consts = None if opp else wdl_sf_consts()
+        ev_elo, ev_opp, we, qp = evals_setup(E, x, oppx, consts, "sf")
+        after, elo, oppo, allpol = evals_batch(b, shown, we, qp, ev_elo, ev_opp, oppx)
+        todo, pol, need = _maia_values_plan(after, elo, oppo, allpol)
+        if todo:
+            pre.key = _maia_values_key(todo, elo, oppo, pol, need)
+        if not mix_on() and not (we and we[0].applies(b.fen())) and (b.fen(), ev_elo, ev_opp) not in _MV:
+            pre.single_key = (_board_id(b), ev_elo, ev_opp)
+        pre.planned.set()
+        if pre.key is not None:
+            pre.batch = _maia_values_run(todo, elo, oppo, pol, need)
+        pre.done.set()
+        if pre.single_key is not None:
+            pre.single = maia_value(b, ev_elo, ev_opp)
+        pre.single_done.set()
+    return fn
+
+
+T2_EVAL_TIMEOUT = float(os.environ.get("TOBY2_EVAL_TIMEOUT", "30"))   # seconds: an evaluation module that does not answer is turned off
+T2_MAIA_WAIT = float(os.environ.get("TOBY2_MAIA_WAIT", "120"))   # seconds a Toby 2 search waits for Maia (Toby 1.0 modules only)
+
+
+def _bounded(fn, seconds):
+    """Runs fn() in a daemon thread: (True, result), or (False, reason) when it raised or did not finish within `seconds` (a missing
+    module or file may block or fail: the search must still answer and send its bestmove)."""
+    box = {}
+    tl = (getattr(_MUTE, "on", False), getattr(_MUTE, "capture", None), getattr(_FT, "force", None))   # this thread's state goes along
+
+    def _run():
+        _MUTE.on, _MUTE.capture, _FT.force = tl
+        try:
+            box["v"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["e"] = f"{type(exc).__name__}: {exc}"
+    th = WThread(target=_run, daemon=True)
+    th.start()
+    th.join(seconds)
+    if th.is_alive():
+        return False, f"no answer within {seconds:.0f} s"
+    if "e" in box:
+        return False, box["e"]
+    return True, box["v"]
+
+
+def _t1_evals(b, E, x, dist, lee, root, opp, net_root):
+    """Toby 1.0's evaluation module on a Toby 2 answer (Move Evaluations = Toby 1.0, Position Evaluation = Toby 1.0 / Mix): (evals, root_eval)."""
+    evals, root_eval = None, net_root
+    shown = [u for u, p in sorted(dist.items(), key=lambda kv: -kv[1]) if p >= 0.001][:SF_EVAL_MOVES]
+    consts = None if opp else wdl_sf_consts()
+    oppx = (opp[0], opp[1]) if opp else None
+    if consts:
+        evals, rev = toby_evals(b, E, x, shown, lee, {}, root, time.time() + 12, oppx, consts=consts, src="sf", dist=dist)
+    else:
+        lee_w = {u: (v[0], sf_to_leela_q(v[1]), 0.0, sf_to_leela_q(v[3])) for u, v in lee.items()}
+        evals, rev = toby_evals(b, E, x, shown, lee_w, {}, (sf_to_leela_q(root[0]), 0.0), time.time() + 12, oppx, src="sf", dist=dist)
+    if opts["t2_position_eval"] == "Toby 1.0":
+        root_eval = rev
+    elif opts["t2_position_eval"] == "Mix" and rev:
+        to_wdl = lambda wl, d: ((1 - d + wl) / 2, d, (1 - d - wl) / 2)
+        a1, a2 = to_wdl(*net_root), to_wdl(*rev)
+        m = [(1 - T2_MIX_W) * p + T2_MIX_W * q for p, q in zip(a1, a2)]
+        root_eval = (m[0] - m[2], m[1])
+    if opts["t2_move_evals"] != "Toby 1.0":
+        evals = None
+    return evals, root_eval
+
+
+def _search_t2_answer(S, b, E, Eo, opp, side, src, values, leela, want_head, why, t0, emit_, movetime, mode, pre, kids=None):
+    on_base = None
+    if pre is not None:
+        x0 = rule_params(E)[0]
+
+        def on_base(enc, bout, base, lf_get):   # called by Toby2Search.run once pass 1 is done (main thread): starts the prefetch thread
+            pre.start(_evals_prefetch_fn(S, b, E, x0, opp, (enc, bout, base, lf_get)))
+    if kids is not None:   # Toby 2's child W/D/L batch also starts once pass 1 is done (after Toby 1.0's prefetch when both run)
+        on_base0 = on_base
+
+        def on_base(enc, bout, base, lf_get):
+            if on_base0 is not None:
+                on_base0(enc, bout, base, lf_get)
+            kids.on_base(enc, bout, base, lf_get)
+    try:
+        r = S.run(b, E, Eo, side, source=src, values=values, leela=leela, on_base=on_base,
+                  before_heads=kids.wait if kids is not None else None)
+    except Exception as exc:  # noqa: BLE001
+        out(f"info string Toby 2 failed ({type(exc).__name__}: {exc}): {T1_ANSWERS}")
+        T2["fb_said"] = True   # 2.2.1 fallback: the failure is already said
+        return None
+    if r is None or stop_flag.is_set():
+        return None
+    cfg = T2.get("cfg")
+    if cfg and cfg.get("blunder_penalty") and r.get("values"):   # product-file field (toby2_blunder_fix.md); absent: nothing changes
+        cad = _T2MOD.TIME_CONTROL_CADENCE[mode]
+        r["logp"], beta = _T2MOD.blunder_penalty(r["logp"], r["legal"], r["values"], E, cad, cfg["blunder_penalty"])
+        r["path"]["blunder_penalty"] = f"beta {beta:.4f}" if beta > 0 else "off for this cadence / rating"
+    if T2_SF_THREADS != 1:
+        r["path"]["sf_threads"] = f"{T2_SF_THREADS} (NOT the values recipe: development only)"
+    if T2.get("accurate_unavailable"):
+        r["path"].update(requested="Toby 2 Accurate", accurate_unavailable=T2["accurate_unavailable"])
+    r["path"].update(product=cfg["product"] if cfg else "none (no product file)", config_sha256=cfg["config_sha256"][:16] if cfg else "-",
+                     cadence=_T2MOD.TIME_CONTROL_CADENCE[mode], clock="game clocks" if CLOCK is not None else "cadence only")
+    if want_head and leela is None:
+        r["path"].update(head="off", leela=f"unavailable: {why}")
+    elif not want_head:
+        r["path"].setdefault("head", "off" if (cfg and cfg.get("head")) else "-")
+    if "leela" in r["path"] and str(r["path"]["leela"]).startswith("failed"):
+        out(f"info string Toby 2 Accurate: Leela search {r['path']['leela']}: network B with Stockfish values answers (head off)")
+        t2_leela_failed(r["path"]["leela"])
+    l_, d_, w_ = (float(x) for x in r["wdl"])
+    net_root = (w_ - l_, d_)
+    ev2 = rev2 = kinfo = None
+    if kids is not None and r["values"] is not None and not stop_flag.is_set():   # Toby 2's per-move W/D/L (2.0.2)
+        tk = time.time()
+        ok, got = _bounded(lambda: kids.finish(r["legal"], r["logp"], r["values"]), T2_EVAL_TIMEOUT)
+        if ok:
+            ev2, rev2, _, kinfo = got
+            kinfo["t_finish"] = time.time() - tk
+        else:
+            out(f"info string Toby 2: per-move W/D/L unavailable ({got}): Move Evaluations Off for this move, the position's W/D/L from "
+                "network B's head")
+    if os.environ.get("TOBY2_DUMP"):   # development / parity: the exact answer, one JSON line per search
+        try:
+            d2 = {"fen": b.fen(), "moves": [m.uci() for m in b.move_stack], "E": E, "Eo": Eo, "legal": r["legal"],
+                  "logp": [float(x) for x in r["logp"]], "wdl": [float(x) for x in r["wdl"]], "path": r["path"],
+                  "values": r["values"], "candidates": r["candidates"], "timings": r["timings"],
+                  "lfeat": None if r.get("lfeat") is None else [[float(x) for x in row] for row in r["lfeat"]]}
+            if kinfo is not None:   # 2.0.2: Toby 2's child W/D/L (the mover's W, D, L per evaluated move) and the position's sum
+                d2["evals2"] = {"moves": kinfo["moves"], "wdl": kinfo["wdl"], "covered": kinfo["covered"], "wdl_y60": kinfo.get("wdl_y60"),
+                                "position": [(1 - rev2[1] + rev2[0]) / 2, rev2[1], (1 - rev2[1] - rev2[0]) / 2]}
+            with open(os.environ["TOBY2_DUMP"], "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(d2) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            out(f"info string Toby 2: dump failed ({exc})")
+    dist = {u: float(math.exp(lp)) for u, lp in zip(r["legal"], r["logp"])}
+    tm = r["timings"]
+    out("info string toby path " + json.dumps(r["path"], separators=(",", ":")))
+    out("info string toby timing toby2 " + " ".join(f"{k} {v:.3f}s" for k, v in tm.items() if isinstance(v, float)))
+    PRIOR.clear()
+    PRIOR.update({u: float(math.exp(lp)) for u, lp in zip(r["legal"], r.get("masked_logp", r["logp"]))})
+    sf = r["values"]
+    if sf is None:   # network alone: no Stockfish line; the position's W/D/L from the network
+        if kids is not None:
+            out("info string toby evaluation position head (network alone, no Stockfish values: no per-move W/D/L)")
+        emit_(3, dist, {}, {}, None, 1, t0, False, None, net_root)
+        return dist
+    try:
+        lee, root = _sf_pseudo_leela(sf)
+    except Exception as exc:  # noqa: BLE001   (display only: the lines then carry no Stockfish-derived value)
+        out(f"info string Toby 2: Stockfish values not converted ({type(exc).__name__}: {exc})")
+        lee, root = {}, None
+    x = rule_params(E)[0]
+    if opts["move_choice"] == "human" and opts["t2_blunder_check"] and mode == "Classical" and _NNC is not None:   # Human mode: Toby 1.0's play-time check
+        es = {u: _NNC.expected_score(E, cp) if abs(cp) < 10000 else (1.0 if cp > 0 else 0.0) for u, cp in sf.items()}
+        top = max(es.values())
+        PLAY_LOSS.update(E=E, loss={u: 100 * (top - v) for u, v in es.items()})
+    evals, root_eval = None, net_root
+    want_t1, _ = t2_eval_wants(movetime)
+    if want_t1 and maia is None:
+        out(f"info string Toby 2: Toby 1.0's evaluation module unavailable (Maia not loaded: {load_error or ('still loading' if not ready.is_set() else 'not in this package')}): "
+            "its Move / Position Evaluations are Off for this move")
+    if want_t1 and maia is not None and root is not None and not stop_flag.is_set():
+        ok, got = _bounded(lambda: _t1_evals(b, E, x, dist, lee, root, opp, net_root), T2_EVAL_TIMEOUT)
+        if ok:
+            evals, root_eval = got
+        else:
+            out(f"info string Toby 2: Toby 1.0's evaluation module unavailable ({got}): its Move / Position Evaluations are Off for this move")
+        if pre is not None:   # the prefetch's use (timing only: the numbers are the same either way)
+            out(f"info string toby timing toby2 evals prefetch_batch {pre.stats['batch_hit']:.0f} prefetch_single {pre.stats['single_hit']:.0f}")
+    if ev2 is not None:
+        if opts["t2_move_evals"] == "Toby 2" and movetime is None:
+            evals = ev2
+            T2_SHOWN.update(ev2)   # every evaluated move is listed (also below 0.1 %)
+        if opts["t2_position_eval"] == "Toby 2":
+            root_eval = rev2
+        k_ = kinfo
+        out(f"info string toby timing toby2 children {k_['t_prefetch'] + k_['t_finish']:.3f}s prefetched {k_['prefetched']} "
+            f"after {k_['missing']} wait {tm.get('children_wait', 0.0):.3f}s" + (f" prefetch_error {k_['err']}" if k_["err"] else ""))
+        wh, dh = net_root
+        hw, hl = (1 - dh + wh) / 2, (1 - dh - wh) / 2
+        sw, sl = (1 - rev2[1] + rev2[0]) / 2, (1 - rev2[1] - rev2[0]) / 2
+        out(f"info string toby evaluation moves {opts['t2_move_evals']} position {opts['t2_position_eval']} evaluated {k_['evaluated']} "
+            f"covered {k_['covered']:.4f} sum wdl {int(round(1000 * sw))} {int(round(1000 * rev2[1]))} {int(round(1000 * sl))} "
+            f"es {sw + rev2[1] / 2:.4f} head wdl {int(round(1000 * hw))} {int(round(1000 * dh))} {int(round(1000 * hl))} "
+            f"es {hw + dh / 2:.4f} gap {(sw + rev2[1] / 2) - (hw + dh / 2):+.4f}")
+    if stop_flag.is_set():
+        return dist
+    emit_(3, dist, lee, {}, root, V2_BASE, t0, False, evals, root_eval)
+    return dist
+
+
+def _await_stop(infinite):
+    while infinite and not stop_flag.is_set():
+        time.sleep(0.02)
+
+
+def t2_fallback_answer(b, legal, t0, infinite=False):
+    """2.2.1 (no Toby 1.0 shipped): the answer when Toby 2's full answer is not there: the time ran out or a 'stop' came first, or Toby 2
+    failed. Network B alone, value inputs masked (the same path as a move with less than TOBY2_VALUES_BELOW seconds: no Stockfish values,
+    so no blunder penalty), said in an info string; if network B is unavailable, Stockfish's move at the base budget, else the first legal
+    move, said too. Never silent, never Maia."""
+    prov = T2.pop("prov", None)
+    if prov is not None and prov[0] == b.fen() and stop_flag.is_set():   # 2.2.1: the provisional block was shown: its move, no new block
+        out("info string Toby 2: stopped before the full answer: the provisional answer (network B alone) is the move")
+        _await_stop(infinite)   # go infinite: bestmove only after the GUI's stop (UCI)
+        out(f"bestmove {pick_move(prov[1], b)}")
+        return
+    said = T2.pop("fb_said", False) or T2.get("error") or not t2_on()   # a failure already said (Toby 2 failed / unavailable / not found)
+    try:
+        net = load_t2()
+        if net is None:
+            raise RuntimeError(T2.get("error") or "network B unavailable")
+        E, opp = side_ratings(b)
+        S = t2_searcher()
+        r = S.run(b, E, opp[0] if opp else E, t2_side(net), source="Network", values=False)
+        dist = {u: float(math.exp(lp)) for u, lp in zip(r["legal"], r["logp"])}
+        if stop_flag.is_set():
+            msg = "the time ran out before the full answer: network B alone"
+        elif said:
+            msg = "network B alone"
+        else:   # no stop and no error: Stockfish's search ended without a value for every legal move (StockfishCalc.evaluate -> None)
+            msg = "Stockfish gave no complete set of values: network B alone"
+        out(f"info string Toby 2: {msg} answers (value inputs masked, no blunder penalty) ({time.time() - t0:.2f}s)")
+        out("info string toby path " + json.dumps(dict(r["path"], fallback="network alone"), separators=(",", ":")))
+        _await_stop(infinite)   # go infinite: bestmove only after the GUI's stop (UCI)
+        out(f"bestmove {pick_move(dist, b)}")
+        return
+    except Exception as exc:  # noqa: BLE001
+        why2 = f"{type(exc).__name__}: {exc}"
+    mv = legal[0]
+    try:
+        if os.path.exists(SF_PATH):
+            e = T2.get("eng") or StockfishCalc(fixed_threads=1)
+            v = e.evaluate(b, V2_BASE)
+            if v:
+                mv = max(v, key=v.get)
+    except Exception:  # noqa: BLE001
+        pass
+    out(f"info string Toby 2 unavailable ({why2}): Stockfish's move answers (no Toby 1.0 in this Toby)")
+    _await_stop(infinite)   # go infinite: bestmove only after the GUI's stop (UCI)
+    out(f"bestmove {mv}")
 
 
 def _search(movetime, infinite=False, bd=None, nested=False):
     global lc0, LEELA_BROKEN
     t0 = time.time()
+    T2.pop("fb_said", None)
+    if not nested:
+        T2.pop("prov", None)
     b = (bd if bd is not None else board).copy()
     legal = [m.uci() for m in b.legal_moves]
     if not legal:
         out("bestmove 0000")
         return
-    if not ready.is_set():
-        ready.wait()
+    if maia_wanted():   # a Toby 2 search with the default options never waits for Maia (2.0.2: not even loaded)
+        wait_maia()
+    t2_say_missing()
+    if t2_on():
+        t2_say_nn_missing()
+    if t2_on() and not stop_flag.is_set():   # Toby 2: network B + Toby 1.0's Stockfish recipe (Toby 1.0 answers only if it fails, and says so)
+        E, opp = side_ratings(b)
+        out(f"info string Toby 2: rating {own_rating(b)} ({opts['source']}) -> strength {strength_text(E)}; time control {opts['mode']}; "
+            f"candidates {opts['t2_candidates']}" + (f"; opponent strength {strength_text(opp[0])}" if opp else "; opponent: same rating") + versions_text())
+        EV_LAST.clear(); PLAY_LOSS.clear(); ROOT_LAST.clear(); LISTED.clear(); T2_SHOWN.clear()
+        EVAL_K[0] = SF_EVAL_MOVES
+        d2 = _search_t2(b, E, opp, t0, lambda *a, **k: emit(*a, bd=b, **k), movetime)
+        if d2 is not None:
+            deep = infinite and opts.get("deepening") and not nested
+            if deep and not stop_flag.is_set():
+                try:
+                    deepen(b, d2, t0)
+                except Exception as exc:  # noqa: BLE001
+                    out(f"info string toby deepening stopped ({exc})")
+                if T2.get("search") is not None:   # no body pass queued past the deepening (a stopped or failed nested search)
+                    T2["search"].next_body = None
+            if infinite:
+                while not stop_flag.is_set():
+                    time.sleep(0.02)
+            out(f"bestmove {pick_move(d2, b)}")
+            return
+    if not TOBY1_SHIPPED:   # 2.2.1: no Toby 1.0 to fall back on: Toby 2's network alone (or Stockfish), always said
+        t2_fallback_answer(b, legal, t0, infinite and not nested)
+        return
+    wait_maia()   # Toby 1.0 answers (chosen, or Toby 2 failed / unavailable: said above): Maia is loaded now if it was not
     if maia is None:
         out(f"info string ERROR {load_error}")
         out(f"bestmove {legal[0]}")
@@ -2308,6 +3779,7 @@ def _search(movetime, infinite=False, bd=None, nested=False):
     PRIOR.clear()
     PRIOR.update(pm)
     EV_LAST.clear()
+    T2_SHOWN.clear()
     PLAY_LOSS.clear()
     ROOT_LAST.clear()
     LISTED.clear()
@@ -2365,7 +3837,7 @@ def _search(movetime, infinite=False, bd=None, nested=False):
                                     sfraw.update(r)
                         except Exception:  # noqa: BLE001
                             pass
-                    sf_thread = threading.Thread(target=_sf_values, daemon=True)
+                    sf_thread = WThread(target=_sf_values, daemon=True)
                     sf_thread.start()
                 lee, root = lc0.search(fen, 1024)  # step 3: the main search
                 pol = dict(getattr(lc0, "last_policy", {}))   # Leela's prior of the main search (an input of the network; the complements overwrite it)
@@ -2583,6 +4055,39 @@ def lik_model():
     return m if m in CORRECTOR_LIK else "T5"
 
 
+_LIK_STATIC = []
+LIK_SAID = [False]
+
+
+def likelihood_unavailable():
+    """Why 'toby likelihood' cannot be served in this process, or None. Known without loading anything (at 'uci'): Maia-3's code and
+    weights (a package without Maia, e.g. the core package), the Stockfish network and Stockfish; after the loading, a Maia that failed."""
+    if not TOBY1_SHIPPED:   # 2.2.1: no Maia in this Toby; never looked for elsewhere (Hugging Face cache, download)
+        return TOBY1_ABSENT
+    if not _LIK_STATIC:
+        why = None
+        try:
+            import importlib.util
+            if MAIA_REPO not in sys.path and os.path.isdir(MAIA_REPO):
+                sys.path.insert(0, MAIA_REPO)
+            if importlib.util.find_spec("maia3") is None:
+                why = "Maia-3 is not in this package"
+            elif maia_checkpoint() is None:
+                why = "Maia-3's weights are not in this package (maia/maia3-79m.pt)"
+        except Exception as exc:  # noqa: BLE001
+            why = f"Maia-3 cannot be loaded ({type(exc).__name__})"
+        if why is None and CORRECTOR_SF is None:
+            why = "the Stockfish network is missing (nn/corrector_sf_weights.json)"
+        if why is None and not os.path.exists(SF_PATH):
+            why = "Stockfish is missing"
+        _LIK_STATIC.append(why)
+    if _LIK_STATIC[0]:
+        return _LIK_STATIC[0]
+    if ready.is_set() and maia is None:
+        return load_error or "Maia not loaded"
+    return None
+
+
 def likelihood(u, ratings, opp=None, clock="current", dist=None, show_sf=False, bd=None, eng=None, emit=None, spec_ok=True):
     """Probability that a player of each rating plays the move u in the current position (Siby's Bayesian Elo estimate).
     One Stockfish search (it does not depend on the rating), then Maia (with the previous positions) and the Stockfish network for
@@ -2601,7 +4106,10 @@ def likelihood(u, ratings, opp=None, clock="current", dist=None, show_sf=False, 
     emit = emit or out   # a review batch collects each answer, then prints the answers in order (toby batch)
     model = "T5"
     try:
-        ready.wait()
+        why_not = likelihood_unavailable()   # known at once (no wait for the loading): said, then the end line
+        if why_not:
+            raise RuntimeError(why_not)
+        wait_maia()   # loaded at the first request in a Toby 2 process (2.0.2)
         if maia is None:
             raise RuntimeError(load_error or "Maia not loaded")
         if CORRECTOR_SF is None or not os.path.exists(SF_PATH):
@@ -2676,7 +4184,7 @@ def likelihood(u, ratings, opp=None, clock="current", dist=None, show_sf=False, 
                         v_ = e_.extend(b, list(c_), V2_EXT)
                         if v_ is not None:
                             pre[c_] = v_
-                ths = [threading.Thread(target=_ext, args=(e_,), daemon=True) for e_ in (eng, sp)]
+                ths = [WThread(target=_ext, args=(e_,), daemon=True) for e_ in (eng, sp)]
                 [t_.start() for t_ in ths]
                 [t_.join() for t_ in ths]
             finally:
@@ -2715,6 +4223,176 @@ def likelihood(u, ratings, opp=None, clock="current", dist=None, show_sf=False, 
     emit(f"info string toby likelihood end model {model}")
 
 
+# ----------------------------------------------------------------------------------------------------- 'toby level' (Toby 2 level head, no Maia)
+# the method page. Per half-move, Toby 2's body B at two fixed anchors (1600, 2400) and the level head give the move's
+# log-likelihood curve over the ratings (natural log, summable over a player's moves). Siby sums the curves and applies the calibration line.
+_LH_DIR = HERE / "nn" / "level_t2" / "lh"
+
+
+def _first_existing(env, cands):
+    if os.environ.get(env):
+        return Path(os.environ[env])
+    for c in cands:
+        if c.exists():
+            return c
+    return cands[0]
+
+
+LEVEL_HEAD = _first_existing("TOBY2_LEVEL_HEAD", [HERE / "nets" / "toby2_level.pt", _LH_DIR / "frozen" / "toby2_level_a2.pt"])
+LEVEL_CAL = _first_existing("TOBY2_LEVEL_CAL", [HERE / "nets" / "toby2_level_cal.json", _LH_DIR / "frozen" / "calibration.json"])
+LEVEL_MODEL = "toby2-level-v1"
+LEVEL_GRID = list(range(1200, 3001, 50))   # the answer's ratings (the head's grid is 1200-3000 step 25; step 50 keeps E_A within ~1 Elo)
+LEVEL = {"svc": None, "error": None, "lock": threading.Lock(), "net_lock": threading.Lock(), "mod": None}
+TC_CADENCE = {"Classical": "classical", "Rapid": "rapid", "Blitz": "blitz"}
+
+
+def _level_mod():
+    if LEVEL["mod"] is None:
+        if str(_LH_DIR) not in sys.path:
+            sys.path.insert(0, str(_LH_DIR))
+        import levelgen as _lg
+        LEVEL["mod"] = _lg
+    return LEVEL["mod"]
+
+
+def level_unavailable():
+    """Why 'toby level' cannot be served here, or None (known without loading the network)."""
+    if _T2MOD is None:
+        return T2.get("error") or "Toby 2 module missing"
+    if T2_WEIGHTS is None or not T2_WEIGHTS.exists():
+        return "Toby 2 network missing"
+    if not LEVEL_HEAD.exists():
+        return f"level head missing ({LEVEL_HEAD.name})"
+    try:
+        _level_mod()
+    except Exception as exc:  # noqa: BLE001
+        return f"level module: {exc}"
+    return None
+
+
+def level_service():
+    with LEVEL["lock"]:
+        if LEVEL["svc"] is None and LEVEL["error"] is None:
+            try:
+                net = _load_t2()
+                if net is None:
+                    raise RuntimeError(T2.get("error") or "Toby 2 network unavailable")
+                LEVEL["svc"] = _level_mod().GenService(net, str(LEVEL_HEAD))
+            except Exception as exc:  # noqa: BLE001
+                LEVEL["error"] = f"{type(exc).__name__}: {exc}"
+        return LEVEL["svc"]
+
+
+def level_calibration_lines():
+    """One 'info string toby level calibration ...' line per cadence group (calibration file of the frozen variant). Fields: grid, E_A
+    (tau, prior mean / sd, correction and its coefficients on the linear-spline basis [1, x, (x-1800)+, (x-2200)+, (x-2500)+] with x
+    bounded to [1400, 2800]), E_R (tau, s, drift coefficients on the same basis of the given rating), the result constants c, the per-game
+    sd scale, and 'use': which estimator Siby should take from this head for that group (level) or from Toby 1.0 (toby1)."""
+    try:
+        cal = json.loads(Path(LEVEL_CAL).read_text())
+    except Exception as exc:  # noqa: BLE001
+        return [f"info string toby level calibration error {exc}"]
+    res = []
+    for g, c in cal["groups"].items():
+        a, r = c["E_A"], c["E_R"]
+        use = c.get("use", {"E_A": "level", "E_R": "level"})
+        f = lambda xs: " ".join(f"{float(x):.10g}" for x in xs)
+        res.append(f"info string toby level calibration model {cal.get('model', LEVEL_MODEL)} group {g} grid 1200 3000 25 "
+                   f"ea_tau {a['tau']} ea_mean {a['prior_mean']:.2f} ea_sd {a['prior_sd']:.2f} ea_corr {a['correction']} ea_coef {f(a['coef'])} "
+                   f"knots 1800 2200 2500 bounds 1400 2800 er_tau {r['tau']} er_s {r['s']} er_drift {f(r['drift_coef'])} "
+                   f"c_er {c['result_c']['E_R']} c_ea {c['result_c']['E_A']} sd_scale {c.get('sd_scale', 1.0):.4f} "
+                   f"use_ea {use.get('E_A', 'level')} use_er {use.get('E_R', 'level')}")
+    return res
+
+
+def level_display_lines():
+    """One 'info string toby level display model M group g ea_stretch k ea_coef_review c0 .. c4 ea_stretch_review k ea_cap_high e
+    ea_cap_low e' line per group whose calibration has 'ea_display' (nn/level_t2/lh/frozen_open_c/ea_display_fields.json, merged into
+    nets/toby2_level_cal.json by nn/level_t2/lh/merge_ea_display.py): the E_A display used when no rating is known (E_R unchanged).
+    A separate line, printed after the calibration lines: Siby's parsers append unknown words to the previous field, so the calibration
+    lines stay byte-identical to 2.2.1's. No 'ea_display' in the file (2.2.1's calibration): no line."""
+    try:
+        cal = json.loads(Path(LEVEL_CAL).read_text())
+    except Exception:  # noqa: BLE001
+        return []   # the calibration lines already say the error
+    g = lambda x: f"{float(x):.10g}"
+    res = []
+    for grp, c in cal["groups"].items():
+        d = c.get("ea_display")
+        if d:
+            res.append(f"info string toby level display model {cal.get('model', LEVEL_MODEL)} group {grp} ea_stretch {g(d['ea_stretch'])} "
+                       f"ea_coef_review {' '.join(g(x) for x in d['ea_coef_review'])} ea_stretch_review {g(d['ea_stretch_review'])} "
+                       f"ea_cap_high {g(d['ea_cap_high'])} ea_cap_low {g(d['ea_cap_low'])}")
+    return res
+
+
+def level_move(u, best=None, played=None, cad=None, dist=None, bd=None, eng=None, emit=None):
+    """'toby level move <uci> [best <cp> played <cp>] [cadence c] [dist <elo>]' on the current position (before the move). Prints
+    'info string toby level <uci> <r1> <l1> <r2> <l2> ...' (natural log-likelihood of the move at each rating of LEVEL_GRID), with dist
+    'info string toby dist <elo> <uci> <p> ...' (the head's move distribution at that rating, values-free, B's two anchor passes), then
+    'info string toby level end model toby2-level-v1 values given|searched|none [best <cp> played <cp>]' ('searched': Toby's own
+    150k MultiPV search over every move, Toby 2's pass 1; 'none': no Stockfish available, the expected-score term is left out).
+    On an error: 'info string toby level error <reason>' before the end line (Siby skips that move)."""
+    emit = emit or out
+    b = bd if bd is not None else board
+    mode = "given"
+    try:
+        svc = level_service()
+        if svc is None:
+            raise RuntimeError(LEVEL["error"] or "level head unavailable")
+        if cad is None:
+            cad = TC_CADENCE.get(opts["mode"], "classical")
+        if cad not in TC_CADENCE.values():
+            raise ValueError(f"cadence {cad}")
+        if chess.Move.from_uci(u) not in b.legal_moves:
+            raise ValueError(f"illegal move {u}")
+        if best is None or played is None:
+            best = played = None
+            mode = "none"
+            e = eng
+            if e is None and os.path.exists(SF_PATH):
+                global sf_engine
+                if sf_engine is None:
+                    sf_engine = StockfishCalc()
+                e = sf_engine
+            if e is not None:
+                v = e.evaluate(b, V2_BASE)
+                if v is None:
+                    raise RuntimeError("stopped")
+                best, played, mode = max(v.values()), v[u], "searched"
+        with LEVEL["net_lock"]:
+            r = svc.move(b, u, cad, best, played, dist)
+        c = r["curve"]
+        emit(f"info string toby level {u} " + " ".join(f"{e} {float(c[(e - 1200) // 25]):.4f}" for e in LEVEL_GRID))
+        if dist is not None:
+            emit(f"info string toby dist {dist} " + " ".join(f"{m} {p:.6g}" for m, p in sorted(r["dist"].items(), key=lambda kv: -kv[1])))
+        tail = f" best {int(best)} played {int(played)}" if mode == "searched" else ""
+        emit(f"info string toby level end model {LEVEL_MODEL} values {mode}{tail}")
+    except Exception as exc:  # noqa: BLE001
+        emit(f"info string toby level error {exc}")
+        emit(f"info string toby level end model {LEVEL_MODEL} values none")
+
+
+def parse_level(t):
+    """tokens of 'toby level move <uci> ...' -> dict of level_move's arguments (ValueError on a malformed command)."""
+    if len(t) < 4 or t[2] != "move":
+        raise ValueError("usage: toby level move <uci> [best <cp> played <cp>] [cadence classical|rapid|blitz] [dist <elo>]")
+    a = {"u": t[3], "best": None, "played": None, "cad": None, "dist": None}
+    rest = t[4:]
+    while rest:
+        k = rest[0]
+        if k in ("best", "played"):
+            a[k] = int(float(rest[1]))
+        elif k == "cadence":
+            a["cad"] = rest[1].lower()
+        elif k == "dist":
+            a["dist"] = int(float(rest[1]))
+        else:
+            raise ValueError(f"unknown keyword {k}")
+        rest = rest[2:]
+    return a
+
+
 # ----------------------------------------------------------------------------------------------------- review batches (parallel 'toby likelihood')
 REVIEW_POOL = []                 # single-thread Stockfish engines of the review batches, kept between batches
 _REVIEW_LOCK = threading.Lock()
@@ -2734,10 +4412,12 @@ def review_workers():
 def run_batch(items):
     """'toby batch begin' ... 'toby batch end': the queued 'toby likelihood' commands run in parallel, one single-thread Stockfish per
     worker; each answer is the block a single 'toby likelihood' prints, and the blocks are printed in the order of the commands (each as
-    soon as it and the ones before are done), then 'info string toby batch end'. The workers share Maia (one call at a time)."""
+    soon as it and the ones before are done), then 'info string toby batch end'. The workers share Maia (one call at a time).
+    'toby level move' commands may be queued too (kind "level"): Maia is not needed for them, they share Toby 2's network (one call at
+    a time) and use the worker's Stockfish only when no values are given."""
     try:
-        ready.wait()
-        wait_maia_ft()
+        if any(it.get("kind") != "level" for it in items):
+            wait_maia(ft=True)
         k = max(1, min(review_workers(), len(items)))
         with _REVIEW_LOCK:
             while len(REVIEW_POOL) < k and os.path.exists(SF_PATH):
@@ -2745,6 +4425,8 @@ def run_batch(items):
         free = queue.Queue()
         for e in REVIEW_POOL[:k]:
             free.put(e)
+        for _ in range(k - len(REVIEW_POOL[:k])):   # no Stockfish: level items with values still run (a search-less worker)
+            free.put(None)
         done = [None] * len(items)
         nxt = [0]
         plock = threading.Lock()
@@ -2761,7 +4443,10 @@ def run_batch(items):
             buf = []
             e = free.get()
             try:
-                likelihood(it["u"], it["ratings"], it["opp"], it["clock"], it["dist"], it["sf"], bd=it["board"], eng=e, emit=buf.append, spec_ok=False)
+                if it.get("kind") == "level":
+                    level_move(it["u"], it["best"], it["played"], it["cad"], it["dist"], bd=it["board"], eng=e, emit=buf.append)
+                else:
+                    likelihood(it["u"], it["ratings"], it["opp"], it["clock"], it["dist"], it["sf"], bd=it["board"], eng=e, emit=buf.append, spec_ok=False)
             finally:
                 free.put(e)
             done[i] = buf
@@ -2781,14 +4466,16 @@ def run_batch(items):
                 one(i)
 
         for _ in range(k):
-            th = threading.Thread(target=worker_loop, daemon=True)
+            th = WThread(target=worker_loop, daemon=True)
             th.start()
             ths.append(th)
         for th in ths:
             th.join()
         for i in range(len(items)):   # stopped: the answers not computed say so, in order
             if done[i] is None:
-                done[i] = [f"info string toby likelihood error stopped", f"info string toby likelihood end model {lik_model()}"]
+                done[i] = ([f"info string toby level error stopped", f"info string toby level end model {LEVEL_MODEL} values none"]
+                           if items[i].get("kind") == "level" else
+                           [f"info string toby likelihood error stopped", f"info string toby likelihood end model {lik_model()}"])
         flush()
     except Exception as exc:  # noqa: BLE001
         out(f"info string toby batch error {exc}")
@@ -2801,6 +4488,14 @@ def stop_review_pool():
     if _SPEC["eng"] is not None:
         _SPEC["eng"].quit()
         _SPEC["eng"] = None
+    for k in ("eng", "spec3"):   # Toby 2's own Stockfish engines
+        e = T2.get(k) if isinstance(globals().get("T2"), dict) else None
+        if e is not None:
+            try:
+                e.quit()
+            except Exception:  # noqa: BLE001
+                pass
+            T2[k] = None
 
 
 atexit.register(stop_review_pool)
@@ -2840,11 +4535,14 @@ def uci_options():
     out(f"option name Display type combo default {DEFAULT_DISPLAY} " + " ".join(f"var {s}" for s in DISPLAYS))
     out("option name MultiPV type spin default 500 min 1 max 500")
     out("option name UCI_ShowWDL type check default true")
-    out("option name Endgame Evaluation type combo default M var Off " + " ".join(f"var {c}" for c in ENDGAME_CANDIDATES))
+    if TOBY1_SHIPPED:   # Endgame Evaluation acts inside Toby 1.0's evaluation module only
+        out("option name Endgame Evaluation type combo default M var Off " + " ".join(f"var {c}" for c in ENDGAME_CANDIDATES))
     out("option name Provisional Lines type check default true")
     out("option name Leela Preload type check default false")
     out("option name Deepening type check default true")   # go infinite: after the final block, the 3 most probable moves and the best move view get the next position's own evaluation (blended), one updated block   # true: lc0 starts right after readyok where Leela is used (analysis Toby)
-    if CORRECTOR_SF is not None:
+    if CORRECTOR_SF is not None and not TOBY1_SHIPPED:   # 2.2.1: Toby 1.0's options are not advertised (still accepted, see toby1_value)
+        out(f"option name Stockfish Threads type spin default {opts['sf_threads']} min 0 max 256")
+    elif CORRECTOR_SF is not None:
         cur = "Fast" if (opts.get("hybrid") or opts["calculator"] == "Stockfish") else "Accurate"
         out(f"option name Precision type combo default {cur} " + " ".join(f"var {p}" for p in PRECISIONS))
         # Precision = Accurate (Calculator Auto: Leela in Classical with an NVIDIA GPU, Stockfish elsewhere) / Fast (Stockfish always).
@@ -2853,13 +4551,39 @@ def uci_options():
         out(f"option name Review Workers type spin default {opts.get('review_workers', 0)} min 0 max 64")
         out(f"option name Stockfish Nodes type spin default {opts['sf_nodes']} min 0 max 1000000000")
         out(f"option name Maia Threads type spin default {opts['maia_threads']} min 0 max 256")
-    if CORRECTOR_LIK:   # network of 'toby likelihood' in Classical (Siby's level estimate): T5 (default), Auto (LIK_AUTO per lc0 device), H8, H8s, H6b
+    if CORRECTOR_LIK and TOBY1_SHIPPED:   # network of 'toby likelihood' in Classical (Siby's level estimate): T5 (default), Auto (LIK_AUTO per lc0 device), H8, H8s, H6b
         out(f"option name Likelihood Model type combo default {opts['lik_model']} " + " ".join(f"var {m}" for m in LIK_MODELS))
-    if os.path.exists(MAIA_FT_PATH) and (CORRECTOR_SF_FT is not None or CORRECTOR_HSF_FT is not None):
+    if TOBY1_SHIPPED and os.path.exists(MAIA_FT_PATH) and (CORRECTOR_SF_FT is not None or CORRECTOR_HSF_FT is not None):
         out(f"option name Fine-tuned Maia type check default {'true' if opts['maia_ft'] else 'false'}")
-    if CORRECTOR is not None:
+    if CORRECTOR is not None and TOBY1_SHIPPED:
         out(f"option name Move Model type combo default {opts['move_model']} " + " ".join(f"var {m}" for m in MOVE_MODELS))
+    if _T2MOD is not None and T2_WEIGHTS is not None and T2_WEIGHTS.exists():   # Toby 2 (network B)
+        if TOBY1_SHIPPED:
+            out(f"option name Move Network type combo default {opts['move_network']} " + " ".join(f"var {m}" for m in MOVE_NETWORKS))
+        offered = [m for m in T2_PRODUCTS if m != "Accurate" or t2_accurate_offered() or opts["t2_product"] == "Accurate"]
+        out(f"option name Toby 2 Product type combo default {opts['t2_product']} " + " ".join(f"var {m}" for m in offered))
+        out(f"option name Leela Head type combo default {opts['t2_head']} " + " ".join(f"var {m}" for m in T2_HEADS))
+        cands = [m for m in _T2MOD.CANDIDATE_SOURCES if TOBY1_SHIPPED or not toby1_value("Candidates", m)]
+        cdef = opts["t2_candidates"] if opts["t2_candidates"] in cands else cands[0]
+        out(f"option name Candidates type combo default {cdef} " + " ".join(f"var {m}" for m in cands))
+        out(f"option name Network Device type combo default {opts['t2_device']} " + " ".join(f"var {m}" for m in T2_DEVICES))
+        out(f"option name Network Threads type spin default {opts['t2_threads']} min 0 max 64")
+        mev = [m for m in MOVE_EVALS if TOBY1_SHIPPED or not toby1_value("Move Evaluations", m)]
+        pev = [m for m in POSITION_EVALS if TOBY1_SHIPPED or not toby1_value("Position Evaluation", m)]
+        out(f"option name Move Evaluations type combo default {opts['t2_move_evals']} " + " ".join(f"var {m}" for m in mev))
+        out(f"option name Position Evaluation type combo default {opts['t2_position_eval']} " + " ".join(f"var {m}" for m in pev))
+        out(f"option name Human Blunder Check type check default {'true' if opts['t2_blunder_check'] else 'false'}")
+        out(f"option name Base Time type spin default {opts['t2_base']} min 0 max 36000")
+        out(f"option name Increment type spin default {opts['t2_inc']} min -1 max 600")
     # the "Mode" option (Prediction | Human) is deliberately not advertised: it only matters for a bot build
+
+
+def toby1_value(nm, val):
+    """True for an option value that selects Toby 1.0 or Maia (Move Network = Toby 1.0, Candidates = Maia C, Move Evaluations = Toby 1.0,
+    Position Evaluation = Toby 1.0 / Mix). Without Toby 1.0 (TOBY1_SHIPPED false) such a value is ignored: the current one stays."""
+    v = val.lower()
+    return ((nm == "Move Network" and v == "toby 1.0") or (nm == "Candidates" and v == "maia c")
+            or (nm == "Move Evaluations" and v == "toby 1.0") or (nm == "Position Evaluation" and v in ("toby 1.0", "mix")))
 
 
 def set_option(t):
@@ -2869,6 +4593,8 @@ def set_option(t):
     nm, val = " ".join(t[i + 1:j]), " ".join(t[j + 1:])
     nm = OPTION_ALIASES.get(nm, nm)
     val = VALUE_ALIASES.get(val, val)
+    if not TOBY1_SHIPPED and toby1_value(nm, val):   # 2.2.1: a value that would need Toby 1.0 / Maia is accepted and ignored (GUIs keep working)
+        return
     if nm == "Rating":   # the old single-rating option no longer exists: say so instead of ignoring it silently
         out("info string Toby: the option Rating no longer exists, use White Rating and Black Rating (one filled = both sides get it)")
     elif nm == "MultiPV":
@@ -2933,12 +4659,59 @@ def set_option(t):
         opts["sf_nodes"] = max(0, int(float(val)))
     elif nm == "Display" and val in DISPLAYS:
         opts["display"] = val
+    elif nm == "Move Network" and val in MOVE_NETWORKS:
+        if val != opts["move_network"]:   # a GUI resending the default is not a choice
+            opts["move_network_set"] = True
+        opts["move_network"] = val
+        if maia_wanted():
+            ensure_maia()
+    elif nm == "Candidates" and _T2MOD is not None and val in _T2MOD.CANDIDATE_SOURCES:
+        if val != opts["t2_candidates"]:   # a GUI resending the default does not override the product file
+            opts["t2_candidates_set"] = True
+        opts["t2_candidates"] = val
+        if maia_wanted():
+            ensure_maia()
+    elif nm == "Toby 2 Product" and {"Fast": "Standard"}.get(val, val) in T2_PRODUCTS:
+        val = {"Fast": "Standard"}.get(val, val)   # the protocol's name of the Standard product
+        if val != opts["t2_product"] and not os.environ.get("TOBY2_CONFIG"):   # reloaded with the other product file at the next search
+            opts["t2_product"] = val
+            T2.update(net=None, search=None, cfg=None, error=None)
+    elif nm == "Leela Head" and val in T2_HEADS:
+        opts["t2_head"] = val
+    elif nm == "Network Device" and val in T2_DEVICES:
+        if val != opts["t2_device"] and T2["net"] is not None:   # reloaded at the next search on the new device
+            T2["net"] = T2["search"] = None
+        opts["t2_device"] = val
+    elif nm == "Network Threads":
+        opts["t2_threads"] = max(0, int(float(val)))
+        if T2["net"] is not None and T2["net"].device == "cpu" and opts["t2_threads"]:
+            import torch
+            torch.set_num_threads(opts["t2_threads"])
+    elif nm == "Move Evaluations":   # Toby 2 / Toby 1.0 / Off; the 2.0.1 check values still work: true = Toby 2, false = Off
+        v_ = {"true": "Toby 2", "false": "Off"}.get(val.lower(), val)
+        if v_ in MOVE_EVALS:
+            opts["t2_move_evals"] = v_
+            if maia_wanted():
+                ensure_maia()
+    elif nm == "Position Evaluation" and val in POSITION_EVALS:
+        opts["t2_position_eval"] = val
+        if maia_wanted():
+            ensure_maia()
+    elif nm == "Human Blunder Check":
+        opts["t2_blunder_check"] = val.lower() == "true"
+    elif nm == "Base Time":
+        opts["t2_base"] = max(0, int(float(val)))
+    elif nm == "Increment":
+        opts["t2_inc"] = max(-1, int(float(val)))
 
 
 def main():
     global worker, CLOCK
     batch = None   # 'toby batch begin': the 'toby likelihood' commands are queued (with their position) until 'toby batch end'
-    threading.Thread(target=load_maia, daemon=True).start()
+    if maia_wanted():   # Toby 1.0 (or TOBY_MAIA_EAGER=1): Maia loads at once, as before; Toby 2 loads it only when something uses it
+        ensure_maia()
+    if t2_on():
+        threading.Thread(target=load_t2, daemon=True).start()   # network B in the background (the first search waits for it if needed)
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=preload_lc0, kwargs={"leela": False}, daemon=True).start()   # Stockfish only: lc0 waits for the GUI's options
     for line in sys.stdin:
@@ -2954,28 +4727,53 @@ def main():
             out("id author Yosha Iglesias")
             out(f"info string toby version {VERSION}")
             uci_options()
-            out("info string toby capabilities likelihood")   # GUIs (Siby) check this before sending 'toby likelihood' (an older Toby ignores it silently)
-            out("info string toby capabilities likelihood-opp")
-            out("info string toby capabilities likelihood-clk")
-            out("info string toby capabilities likelihood-sf")     # 'sf': Stockfish's own values of the same search (best, played, every move)
-            out("info string toby capabilities likelihood-dist")
-            out("info string toby capabilities batch")
-            out("info string toby capabilities maia-device")   # 'info string toby maia device cuda|cpu' before each readyok   # 'toby batch begin' / 'toby batch end': the 'toby likelihood' commands between run in parallel   # 'dist <r>': Toby's and Maia's whole distributions at one rating   # 'toby likelihood <uci> clk <mover s> <opponent s> ...': clocks (used by a time model)   # 'toby likelihood <uci> opp <rating> ...': the opponent's rating given
+            lik_no = likelihood_unavailable()
+            if lik_no:   # Siby skips its level estimate at once (it checks the capabilities below) instead of waiting for answers
+                out("info string toby capabilities")   # a capabilities line with no likelihood word: Siby turns its level estimate
+                out(f"info string toby likelihood unavailable ({lik_no})")   # off at once (no line at all = an older Toby: it waits)
+                LIK_SAID[0] = True   # (batch and maia-device need Maia too: not listed)
+            else:
+                out("info string toby capabilities likelihood")   # GUIs (Siby) check this before sending 'toby likelihood' (an older Toby ignores it silently)
+                out("info string toby capabilities likelihood-opp")
+                out("info string toby capabilities likelihood-clk")
+                out("info string toby capabilities likelihood-sf")     # 'sf': Stockfish's own values of the same search (best, played, every move)
+                out("info string toby capabilities likelihood-dist")
+                out("info string toby capabilities batch")
+                out("info string toby capabilities maia-device")   # 'info string toby maia device cuda|cpu' before each readyok   # 'toby batch begin' / 'toby batch end': the 'toby likelihood' commands between run in parallel   # 'dist <r>': Toby's and Maia's whole distributions at one rating   # 'toby likelihood <uci> clk <mover s> <opponent s> ...': clocks (used by a time model)   # 'toby likelihood <uci> opp <rating> ...': the opponent's rating given
             missing = [n for n in RELEASE_FILES if not (HERE / "nn" / n).exists()]
             if missing and os.path.exists(MAIA_FT_PATH):   # a package without the networks of the sealed test v5: say it, never fall back silently
                 out("info string Toby: WARNING files missing in nn/: " + ", ".join(missing) + " (Classical uses earlier networks; reinstall Toby)")
+            lvl_no = level_unavailable()
+            if lvl_no is None:   # 'toby level move ...' (Toby 2 level head, no Maia); Siby falls back to 'toby likelihood' without it
+                out("info string toby capabilities level")
+            else:
+                out(f"info string toby level unavailable ({lvl_no})")
             out("uciok")
+            if lvl_no is None:   # the frozen calibration of the level head, once, keyed by the model name (Siby applies it)
+                for line in level_calibration_lines() + level_display_lines():   # display lines after the calibration lines
+                    out(line)
         elif c == "isready":   # lc0 is never started here: a process that only answers 'toby likelihood' / 'dist' (Siby's review) never needs it
-            ready.wait()
-            if opts["mode"] == "Classical" and opts.get("maia_ft", True) and os.path.exists(MAIA_FT_PATH):
-                ft_loaded.wait(180)   # the fine-tuned Maia too (a copy of the loaded one: about a second), so that the first search is immediate
+            try:   # Toby 2: network B loaded, the Accurate probe settled, Stockfish started (the first search then answers at once)
+                t2_prepare()
+            except Exception:  # noqa: BLE001   (any error is kept in T2 and said at the search, as before)
+                pass
+            if maia_wanted() or _MAIA_START["started"]:   # Maia only when the options use it, or already loading (2.0.2)
+                wait_maia()
+                if not LIK_SAID[0] and likelihood_unavailable():   # Maia advertised at 'uci' but failed to load: said once
+                    LIK_SAID[0] = True
+                    out(f"info string toby likelihood unavailable ({likelihood_unavailable()})")
+                if opts["mode"] == "Classical" and opts.get("maia_ft", True) and os.path.exists(MAIA_FT_PATH):
+                    ft_loaded.wait(180)   # the fine-tuned Maia too (a copy of the loaded one: about a second), so that the first search is immediate
+            t2_say_missing()
             if maia is not None:   # where Maia runs (GUIs give it 1 thread on a GPU)
                 out(f"info string toby maia device {'cuda' if str(maia[0].cfg.device).startswith('cuda') else 'cpu'}")
+            elif not _MAIA_START["started"] and likelihood_unavailable() is None:   # not loaded yet: where it will run when loaded
+                out(f"info string toby maia device {'cuda' if maia_device().startswith('cuda') else 'cpu'}")
             match_priority()   # the GUI may have changed Toby's priority since its engines started
             if not STARTUP.get("said"):
                 STARTUP["said"] = True
                 t0 = STARTUP["t0"]
-                parts = [f"{k} {STARTUP[k] - t0:.2f}s" for k in ("torch", "maia", "ft") if k in STARTUP]
+                parts = [f"{k} {STARTUP[k] - t0:.2f}s" for k in ("torch", "maia", "ft", "toby2") if k in STARTUP]
                 out(f"info string toby timing since launch: {time.time() - t0:.2f}s at the first readyok ({', '.join(parts)})")
             out("readyok")
             if opts.get("leela_preload"):   # option Leela Preload (an analysis Toby): lc0 loads now, in the background, where Leela is used
@@ -3000,9 +4798,14 @@ def main():
             stop_flag.clear()
             mt = time_budget(t, board.turn)
             CLOCK = go_clock(t, board.turn)
+            try:
+                _ik = "winc" if board.turn == chess.WHITE else "binc"
+                T2_GO_INC[0] = float(t[t.index(_ik) + 1]) / 1000 if _ik in t else None
+            except (ValueError, IndexError):
+                T2_GO_INC[0] = None
             start_leela_for_search()   # lc0 starts lazily, at the first search that needs it, in the background while Maia runs
             HEART["t0"] = HEART["last"] = time.time()
-            worker = threading.Thread(target=search, args=(mt, "infinite" in t), daemon=True)
+            worker = WThread(target=search_guarded, args=(mt, "infinite" in t), daemon=True)
             worker.start()
         elif c == "toby" and len(t) >= 3 and t[1] == "batch" and t[2] == "begin":
             batch = []
@@ -3013,8 +4816,30 @@ def main():
                 stop_flag.set()
                 worker.join(timeout=3)
             stop_flag.clear()
-            worker = threading.Thread(target=run_batch, args=(items,), daemon=True)
+            worker = WThread(target=run_batch, args=(items,), daemon=True)
             worker.start()
+        elif c == "toby" and len(t) >= 2 and t[1] == "level" and batch is not None:   # queued: same arguments as below
+            try:
+                la = parse_level(t)
+                batch.append({"kind": "level", **la, "board": board.copy()})
+            except (ValueError, IndexError) as exc:
+                out(f"info string toby level error {exc}")
+                out(f"info string toby level end model {LEVEL_MODEL} values none")
+        elif c == "toby" and len(t) >= 2 and t[1] == "level":   # toby level move <uci> [best <cp> played <cp>] [cadence c] [dist <elo>]
+            PREFETCH_ABORT.set()
+            if worker is not None and worker.is_alive():
+                stop_flag.set()
+                worker.join(timeout=3)
+            stop_flag.clear()
+            try:
+                la = parse_level(t)
+            except (ValueError, IndexError) as exc:
+                out(f"info string toby level error {exc}")
+                out(f"info string toby level end model {LEVEL_MODEL} values none")
+            else:
+                worker = WThread(target=level_move, args=(la["u"], la["best"], la["played"], la["cad"], la["dist"]),
+                                          kwargs={"bd": board.copy()}, daemon=True)
+                worker.start()
         elif c == "toby" and len(t) >= 4 and t[1] == "likelihood" and batch is not None:   # queued: same arguments as below
             opp_r, clk_r, dist_r, show_sf, rest = None, None, None, False, t[3:]
             try:
@@ -3051,7 +4876,7 @@ def main():
                 rs = [int(x) for x in rest]
             except (ValueError, IndexError):
                 rs = []
-            worker = threading.Thread(target=likelihood, args=(t[2], rs, opp_r, clk_r, dist_r, show_sf), daemon=True)
+            worker = WThread(target=likelihood, args=(t[2], rs, opp_r, clk_r, dist_r, show_sf), daemon=True)
             worker.start()
         elif c == "stop":
             stop_flag.set()
